@@ -733,3 +733,43 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
 
     reg = (type4x4) reg_f;
 }
+
+// Neuron pair codec ---------------------------------------------------------------------
+//
+// The 4x4 tile is 16 values = 8 PAIRS, which is exactly the codec's natural group: the
+// code width 2m+1 is odd, so gcd(width, 8) = 1 and 8 pairs occupy precisely `width` bytes.
+// `il` therefore indexes whole byte-aligned groups and no code ever straddles a tile, so
+// every byte offset and shift below is a compile-time constant.
+#define NEURON_DEQ(LP, BITS)                                                               \
+template <typename type4x4>                                                                \
+void dequantize_neuron_m##LP(device const block_neuron_m##LP *xb, short il,                \
+                             thread type4x4 & reg) {                                       \
+    const int M = (LP), K = (LP) + 1;                                                      \
+    const int nlv = 1 << M, mask = nlv - 1, kn = 1 << K, last = nlv - 1;                   \
+    const float lo  = (float) xb->lo;                                                      \
+    const float mid = (float) xb->mid;                                                     \
+    const float hi  = (float) xb->hi;                                                      \
+    device const uint8_t * qg = xb->qs + il * (BITS);                                      \
+    for (short t = 0; t < 8; ++t) {                                                        \
+        const int bit = t * (BITS);                                                        \
+        const uint raw = ((uint)qg[bit >> 3] | ((uint)qg[(bit >> 3) + 1] << 8)             \
+                       | ((uint)qg[(bit >> 3) + 2] << 16)) >> (bit & 7);                   \
+        const int c  = (int)(raw & ((1u << (BITS)) - 1u));                                 \
+        const float w = (float)(c & mask) / (float) last;                                  \
+        const float lr = w <= 0.5f ? lo + 2.0f*w*(mid - lo)                                \
+                                   : mid + (2.0f*w - 1.0f)*(hi - mid);                     \
+        const float r  = exp(lr);                                                          \
+        const float th = (float)(c >> M) / (float) kn * 2.0f * M_PI_F - M_PI_F;            \
+        reg[(2*t)   / 4][(2*t)   % 4] = r * cos(th);                                       \
+        reg[(2*t+1) / 4][(2*t+1) % 4] = r * sin(th);                                       \
+    }                                                                                      \
+}
+
+NEURON_DEQ(1,  3)
+NEURON_DEQ(2,  5)
+NEURON_DEQ(3,  7)
+NEURON_DEQ(4,  9)
+NEURON_DEQ(5, 11)
+NEURON_DEQ(6, 13)
+NEURON_DEQ(7, 15)
+NEURON_DEQ(8, 17)
