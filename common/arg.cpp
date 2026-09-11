@@ -311,6 +311,16 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    // Neuron pair codec. Note the block is 512 VALUES while a head is typically 128, so
+    // one block spans four heads -- the per-block anchors must then cover four different
+    // magnitude scales at once, which is exactly the "one outlier stretches the range"
+    // problem per-block ranges exist to avoid. Whether that costs anything here is
+    // measured, not assumed.
+    GGML_TYPE_NEURON_M3,
+    GGML_TYPE_NEURON_M4,
+    GGML_TYPE_NEURON_M5,
+    GGML_TYPE_NEURON_M6,
+    GGML_TYPE_NEURON_M7,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

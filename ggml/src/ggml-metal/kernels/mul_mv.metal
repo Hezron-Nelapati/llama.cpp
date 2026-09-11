@@ -3432,16 +3432,21 @@ void kernel_mul_mv_neuron_m##LP##_f32_impl(                                     
         (device const block_neuron_m##LP *) (src0 + offset0);                                \
     device const float * yy = (device const float *) (src1 + offset1);                       \
     float sumf = 0.0f;                                                                        \
-    for (int ib = 0; ib < nb; ++ib) {                                                        \
-        const float lo  = (float) x[ib].lo;                                                  \
-        const float mid = (float) x[ib].mid;                                                 \
-        const float hi  = (float) x[ib].hi;                                                  \
-        const int last = nlv - 1, jmid = last / 2;                                           \
-        device const uint8_t * qs = x[ib].qs;                                                \
-        device const float * yb = yy + ib * QK_NEURON;                                       \
-        /* 8 pairs occupy exactly (BITS) bytes: width is odd, so gcd(width,8) = 1 */         \
-        for (int g = tiisg * 8; g < QK_NEURON / 2; g += 32 * 8) {                            \
-            device const uint8_t * qg = qs + (g / 8) * (BITS);                               \
+    const int last = nlv - 1;                                                                \
+    /* Stride flat over the row's GROUPS, not over pairs within a block. Striding inside a
+       block ties lane utilisation to the block size: at QK_NEURON = 128 there are only 64
+       pairs, so `g = tiisg*8` left 24 of 32 lanes idle and generation ran 3.4x slower. */   \
+    const int gpb = QK_NEURON / 16;              /* 8-pair groups per block */               \
+    const int ngr = nb * gpb;                                                                \
+    for (int gg = tiisg; gg < ngr; gg += 32) {                                               \
+        const int ib = gg / gpb;                                                             \
+        const int g  = (gg - ib * gpb) * 8;                                                  \
+        {                                                                                    \
+            const float lo  = (float) x[ib].lo;                                              \
+            const float mid = (float) x[ib].mid;                                             \
+            const float hi  = (float) x[ib].hi;                                              \
+            device const float * yb = yy + ib * QK_NEURON;                                   \
+            device const uint8_t * qg = x[ib].qs + (g / 8) * (BITS);                         \
             for (int t = 0; t < 8; ++t) {                                                    \
                 const int bit = t * (BITS);                                                  \
                 const uint c = ((uint)qg[bit >> 3] | ((uint)qg[(bit >> 3) + 1] << 8)         \

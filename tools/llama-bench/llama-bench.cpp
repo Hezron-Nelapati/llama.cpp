@@ -511,6 +511,10 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q5_1") {
         return GGML_TYPE_Q5_1;
     }
+    // neuron_mN -- parsed by name so the eight layouts need no per-type branches here
+    if (s.rfind("neuron_m", 0) == 0 && s.size() == 9 && s[8] >= '1' && s[8] <= '8') {
+        return (ggml_type) (GGML_TYPE_NEURON_M1 + (s[8] - '1'));
+    }
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }

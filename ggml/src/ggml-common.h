@@ -193,9 +193,18 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
 
 // Neuron pair codec ---------------------------------------------------------------------
 //
-// 512 values (256 pairs) per block. NOT 1024: ggml blocks a ROW and requires
-// ne[0] % blck_size == 0, and 1024 does not divide rows of 2560 or 9728. 512 divides every
-// row in every model tested, costing 0.094 bits/value for the anchors.
+// 128 values (64 pairs) per block.
+//
+// Two constraints, and 128 is the largest size meeting both. ggml blocks a ROW and needs
+// ne[0] % blck_size == 0, which rules out 1024 (rows of 2560 and 9728 exist). And a KV
+// cache type must divide n_embd_head_k -- 128 on every model here -- because a block that
+// spans several attention heads would have to cover all their magnitude scales with one
+// set of anchors, which is precisely the failure per-block ranges exist to prevent.
+//
+// 512 worked for weights and was rejected by the KV cache for exactly that reason. Going
+// to 128 costs 0.375 bits/value in anchors instead of 0.094, about 5% on a file, and buys
+// one block size that serves weights and KV alike -- plus a tighter fit per block, since
+// each set of anchors now covers a quarter as many values.
 //
 // Three fp16 anchors define a piecewise-linear ladder in LOG magnitude through lo, mid and
 // hi. `mid` is what lets the ladder BEND rather than only slide and stretch: lo and hi are
@@ -205,7 +214,7 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
 // Codes are joint (k+m)-bit values, angle in the high bits and magnitude in the low:
 //     code = acode * 2^m + mcode
 // packed little-endian across the block, as the odd-width k-quants do.
-#define QK_NEURON 512
+#define QK_NEURON 128
 
 #define NEURON_BLOCK(LP, BITS)                                                    \
     typedef struct {                                                              \

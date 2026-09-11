@@ -329,6 +329,11 @@ template [[host_name("kernel_get_rows_q4_0")]]    kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_q4_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_1,    2, dequantize_q4_1>;
 template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_0,    2, dequantize_q5_0>;
 template [[host_name("kernel_get_rows_q5_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_1,    2, dequantize_q5_1>;
+template [[host_name("kernel_get_rows_neuron_m3")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m3, QK_NEURON/16, dequantize_neuron_m3>;
+template [[host_name("kernel_get_rows_neuron_m4")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m4, QK_NEURON/16, dequantize_neuron_m4>;
+template [[host_name("kernel_get_rows_neuron_m5")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m5, QK_NEURON/16, dequantize_neuron_m5>;
+template [[host_name("kernel_get_rows_neuron_m6")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m6, QK_NEURON/16, dequantize_neuron_m6>;
+template [[host_name("kernel_get_rows_neuron_m7")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m7, QK_NEURON/16, dequantize_neuron_m7>;
 template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0>;
 template [[host_name("kernel_get_rows_mxfp4")]]   kernel get_rows_q_t kernel_get_rows_q<block_mxfp4,   2, dequantize_mxfp4>;
 template [[host_name("kernel_get_rows_q2_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_K,    QK_NL, dequantize_q2_K>;
@@ -460,6 +465,16 @@ template [[host_name("kernel_set_rows_bf16_i32_bf16")]] kernel set_rows_f_t kern
 
 typedef decltype(kernel_set_rows_q32<float, int64_t, block_q8_0, quantize_q8_0>) set_rows_q32_t;
 
+template [[host_name("kernel_set_rows_f32_i64_neuron_m3")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_neuron_m3, quantize_neuron_m3>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_m3")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_neuron_m3, quantize_neuron_m3>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_m4")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_neuron_m4, quantize_neuron_m4>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_m4")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_neuron_m4, quantize_neuron_m4>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_m5")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_neuron_m5, quantize_neuron_m5>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_m5")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_neuron_m5, quantize_neuron_m5>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_m6")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_neuron_m6, quantize_neuron_m6>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_m6")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_neuron_m6, quantize_neuron_m6>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_m7")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_neuron_m7, quantize_neuron_m7>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_m7")]] kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_neuron_m7, quantize_neuron_m7>;
 template [[host_name("kernel_set_rows_f32_i64_q8_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q8_0,   quantize_q8_0>;
 template [[host_name("kernel_set_rows_f32_i32_q8_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int32_t, block_q8_0,   quantize_q8_0>;
 template [[host_name("kernel_set_rows_f32_i64_q4_0")]]   kernel set_rows_q32_t kernel_set_rows_q32<float, int64_t, block_q4_0,   quantize_q4_0>;

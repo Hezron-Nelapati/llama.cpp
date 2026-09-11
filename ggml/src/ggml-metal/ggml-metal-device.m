@@ -1925,6 +1925,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ2_0:
+                    // KV cache written through the neuron codec. m3-m7 only: the encoder
+                    // is instantiated for those, and m1/m2 are too coarse to be worth a
+                    // cache anyway.
+                    case GGML_TYPE_NEURON_M3:
+                    case GGML_TYPE_NEURON_M4:
+                    case GGML_TYPE_NEURON_M5:
+                    case GGML_TYPE_NEURON_M6:
+                    case GGML_TYPE_NEURON_M7:
                         return true;
                     default:
                         return false;
