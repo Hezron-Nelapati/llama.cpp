@@ -2874,6 +2874,22 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    // The neuron types have no DIRECT flash-attention kernel, only the dequantise-to-f16
+    // conversion, so this must be unconditional for them -- including below the ne[1] < 32
+    // cutoff, which for every other type merely picks the faster of two available routes.
+    // Falling through there asks for kernel_flash_attn_ext_neuron_mN_dk*_dv*, which does
+    // not exist, and the pipeline resolves nil.
+    switch (op->src[1]->type) {
+        case GGML_TYPE_NEURON_M3:
+        case GGML_TYPE_NEURON_M4:
+        case GGML_TYPE_NEURON_M5:
+        case GGML_TYPE_NEURON_M6:
+        case GGML_TYPE_NEURON_M7:
+            return true;
+        default:
+            break;
+    }
+
     // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
     // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
     // TODO: tune per device

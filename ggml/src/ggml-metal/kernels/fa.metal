@@ -42,6 +42,11 @@ kernel void kernel_flash_attn_ext_kv_f16(
 
 typedef decltype(kernel_flash_attn_ext_kv_f16<block_q8_0, 32, dequantize_q8_0>) kernel_flash_attn_ext_kv_f16_t;
 
+template [[host_name("kernel_flash_attn_ext_kv_neuron_m3_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_neuron_m3, QK_NEURON, dequantize_neuron_m3>;
+template [[host_name("kernel_flash_attn_ext_kv_neuron_m4_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_neuron_m4, QK_NEURON, dequantize_neuron_m4>;
+template [[host_name("kernel_flash_attn_ext_kv_neuron_m5_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_neuron_m5, QK_NEURON, dequantize_neuron_m5>;
+template [[host_name("kernel_flash_attn_ext_kv_neuron_m6_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_neuron_m6, QK_NEURON, dequantize_neuron_m6>;
+template [[host_name("kernel_flash_attn_ext_kv_neuron_m7_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_neuron_m7, QK_NEURON, dequantize_neuron_m7>;
 template [[host_name("kernel_flash_attn_ext_kv_q4_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q4_0, 32, dequantize_q4_0>;
 template [[host_name("kernel_flash_attn_ext_kv_q4_1_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q4_1, 32, dequantize_q4_1>;
 template [[host_name("kernel_flash_attn_ext_kv_q5_0_f16")]] kernel kernel_flash_attn_ext_kv_f16_t kernel_flash_attn_ext_kv_f16<block_q5_0, 32, dequantize_q5_0>;

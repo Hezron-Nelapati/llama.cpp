@@ -1744,6 +1744,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 case GGML_TYPE_Q4_1:
                 case GGML_TYPE_Q5_0:
                 case GGML_TYPE_Q5_1:
+                // The quantised-KV path dequantises the cache to f16 before the f16 FA
+                // kernels run, so supporting a type here needs only a conversion kernel --
+                // which is the same dequantise_neuron_mX the mul_mm tiles already use.
+                // Without this the op is rejected, FA is silently disabled for the whole
+                // model, and attention falls back to the unfused path: measured 16.4 ->
+                // 7.0 t/s, which looked like the codec being slow and was not.
+                case GGML_TYPE_NEURON_M3:
+                case GGML_TYPE_NEURON_M4:
+                case GGML_TYPE_NEURON_M5:
+                case GGML_TYPE_NEURON_M6:
+                case GGML_TYPE_NEURON_M7:
                     break;
                 case GGML_TYPE_BF16:
                     if (!has_bfloat) {
