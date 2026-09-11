@@ -1008,42 +1008,53 @@ constant half2 kNeuronAng[NEURON_ANGTAB] = {
 // No trig and no general exp: the angle comes from the constant table above, and the
 // ladder is linear in log magnitude with an integer code, so exp(ladder) is exp2(base +
 // code*step) with base and step hoisted per block.
-#define NEURON_DEQ(LP)                                                                     \
-template <typename type4x4>                                                                \
-void dequantize_neuron_m##LP(device const block_neuron_m##LP *xb, short il,                \
-                             thread type4x4 & reg) {                                       \
-    const int last = (1 << (LP)) - 1;                                                      \
-    const int AK = (LP) + 2, AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                     \
-    const uint JM = (1u << JSH) - 1u;                                                      \
-    const float lo  = (float) xb->lo;                                                      \
-    const float mid = (float) xb->mid;                                                     \
-    const float hi  = (float) xb->hi;                                                      \
-    const float L   = M_LOG2E_F;                                                           \
-    const float b0 = lo * L,              s0 = 2.0f*(mid - lo)*L/(float) last;             \
-    const float b1 = (2.0f*mid - hi) * L, s1 = 2.0f*(hi - mid)*L/(float) last;             \
-    device const uint8_t * grp = xb->qs + (il >> 1) * NEURON_GBY(LP);                      \
-    device const uint8_t * ang = grp + NEURON_AOFF(LP);                                    \
-    const short t0 = (il & 1) * 8;                                                         \
-    FOR_UNROLL (short t = 0; t < 8; ++t) {                                                 \
-        const short p  = t0 + t;                                                           \
-        const int   bm = p * (LP);                                                         \
-        uint mv = (uint) grp[bm >> 3];                                                     \
-        if (((bm & 7) + (LP)) >  8) mv |= (uint) grp[(bm >> 3) + 1] <<  8;                 \
-        const int   mc = (int)((mv >> (bm & 7)) & (uint)last);                             \
-        const int   ba = (p >> 1) * AW;                                                    \
-        uint av = (uint) ang[ba >> 3];                                                     \
-        if (((ba & 7) + AW) >  8) av |= (uint) ang[(ba >> 3) + 1] <<  8;                   \
-        if (((ba & 7) + AW) > 16) av |= (uint) ang[(ba >> 3) + 2] << 16;                   \
-        if (((ba & 7) + AW) > 24) av |= (uint) ang[(ba >> 3) + 3] << 24;                   \
-        const uint  v  = (av >> (ba & 7)) & ((1u << AW) - 1u);                             \
-        const int   ia = (int)(v >> JSH);                                                  \
-        const int   ac = (p & 1) ? (int)(2u*(v & JM)) + (ia & 1) : ia;                     \
-        const bool  up = (2*mc > last);                                                    \
-        const float r  = exp2(fma((float) mc, up ? s1 : s0, up ? b1 : b0));                \
-        const half2 cs = kNeuronAng[ac << (10 - AK)];                                      \
-        reg[(2*t)   / 4][(2*t)   % 4] = r * (float) cs.x;                                  \
-        reg[(2*t+1) / 4][(2*t+1) % 4] = r * (float) cs.y;                                  \
-    }                                                                                      \
+#define NEURON_DEQ(LP)                                                                    \
+template <typename type4x4>                                                               \
+void dequantize_neuron_m##LP(device const block_neuron_m##LP *xb, short il,               \
+                             thread type4x4 & reg) {                                      \
+    const int last = (1 << (LP)) - 1;                                                     \
+    const int AK = (LP) + 2, AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                    \
+    const uint JM = (1u << JSH) - 1u;                                                     \
+    const float lo  = (float) xb->lo;                                                     \
+    const float mid = (float) xb->mid;                                                    \
+    const float hi  = (float) xb->hi;                                                     \
+    const float L   = M_LOG2E_F;                                                          \
+    const float b0 = lo * L,              s0 = 2.0f*(mid - lo)*L/(float) last;            \
+    const float b1 = (2.0f*mid - hi) * L, s1 = 2.0f*(hi - mid)*L/(float) last;            \
+    device const uint8_t * grp = xb->qs + (il >> 1) * NEURON_GBY(LP);                     \
+    device const uint8_t * ang = grp + NEURON_AOFF(LP);                                   \
+    const short t0 = (il & 1) * 8;                                                        \
+    /* Walk pair-COUPLES, not pairs. One joint code carries the angles of both, so a      \
+       per-pair loop fetches and unpacks the same field twice -- half the angle reads in  \
+       this path were redundant. `il` is a 16-value slice, so four couples fill it and each\
+       writes one whole reg row. */                                                       \
+    FOR_UNROLL (short s = 0; s < 4; ++s) {                                                \
+        const short pa = t0 + 2*s, pb = pa + 1;                                           \
+        const int   ba = (pa >> 1) * AW;                                                  \
+        uint av = (uint) ang[ba >> 3];                                                    \
+        if (((ba & 7) + AW) >  8) av |= (uint) ang[(ba >> 3) + 1] <<  8;                  \
+        if (((ba & 7) + AW) > 16) av |= (uint) ang[(ba >> 3) + 2] << 16;                  \
+        if (((ba & 7) + AW) > 24) av |= (uint) ang[(ba >> 3) + 3] << 24;                  \
+        const uint v  = (av >> (ba & 7)) & ((1u << AW) - 1u);                             \
+        const int  ia = (int)(v >> JSH);                                                  \
+        const int  ib = (int)(2u*(v & JM)) + (ia & 1);                                    \
+        const int  bma = pa * (LP), bmb = pb * (LP);                                      \
+        uint mva = (uint) grp[bma >> 3];                                                  \
+        if (((bma & 7) + (LP)) > 8) mva |= (uint) grp[(bma >> 3) + 1] << 8;               \
+        uint mvb = (uint) grp[bmb >> 3];                                                  \
+        if (((bmb & 7) + (LP)) > 8) mvb |= (uint) grp[(bmb >> 3) + 1] << 8;               \
+        const int  ma = (int)((mva >> (bma & 7)) & (uint) last);                          \
+        const int  mb = (int)((mvb >> (bmb & 7)) & (uint) last);                          \
+        const bool ua = (2*ma > last), ub = (2*mb > last);                                \
+        const float ra = exp2(fma((float) ma, ua ? s1 : s0, ua ? b1 : b0));               \
+        const float rb = exp2(fma((float) mb, ub ? s1 : s0, ub ? b1 : b0));               \
+        const half2 ca = kNeuronAng[ia << (10 - AK)];                                     \
+        const half2 cb = kNeuronAng[ib << (10 - AK)];                                     \
+        reg[s][0] = ra * (float) ca.x;                                                    \
+        reg[s][1] = ra * (float) ca.y;                                                    \
+        reg[s][2] = rb * (float) cb.x;                                                    \
+        reg[s][3] = rb * (float) cb.y;                                                    \
+    }                                                                                     \
 }
 
 NEURON_DEQ(1)
