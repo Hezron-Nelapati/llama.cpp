@@ -921,41 +921,49 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(1);
             } break;
         case GGML_TYPE_NEURON_M2:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(2);
             } break;
         case GGML_TYPE_NEURON_M3:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(3);
             } break;
         case GGML_TYPE_NEURON_M4:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(4);
             } break;
         case GGML_TYPE_NEURON_M5:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(5);
             } break;
         case GGML_TYPE_NEURON_M6:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(6);
             } break;
         case GGML_TYPE_NEURON_M7:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(7);
             } break;
         case GGML_TYPE_NEURON_M8:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(8);
             } break;
         case GGML_TYPE_Q5_K:
             {
@@ -1242,41 +1250,49 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(1);
             } break;
         case GGML_TYPE_NEURON_M2:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(2);
             } break;
         case GGML_TYPE_NEURON_M3:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(3);
             } break;
         case GGML_TYPE_NEURON_M4:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(4);
             } break;
         case GGML_TYPE_NEURON_M5:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(5);
             } break;
         case GGML_TYPE_NEURON_M6:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(6);
             } break;
         case GGML_TYPE_NEURON_M7:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(7);
             } break;
         case GGML_TYPE_NEURON_M8:
             {
                 nsg = N_SG_NEURON;
                 nr0 = N_R0_NEURON;
+                smem = NEURON_MV_SMEM(8);
             } break;
         case GGML_TYPE_Q5_K:
             {

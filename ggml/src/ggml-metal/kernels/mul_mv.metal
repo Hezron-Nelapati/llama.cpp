@@ -3409,83 +3409,151 @@ template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t
 // in log magnitude, so consecutive levels differ by a constant factor) -- two exp calls
 // rather than 2^m.
 
-#define NEURON_MV_IMPL(LP, BITS)                                                             \
-/* concrete args type, not the `args_t` template the k-quants use: this path serves
-   mul_mv only, and templating it would buy nothing but a second instantiation. */          \
-void kernel_mul_mv_neuron_m##LP##_f32_impl(                                                  \
-        constant ggml_metal_kargs_mul_mv & args,                                             \
-        device const char * src0, device const char * src1,                                  \
-        device char * dst, threadgroup char * shmem,                                         \
-        uint3 tgpig, ushort tiisg, ushort sgitg) {                                           \
-    const short NSG = FC_mul_mv_nsg;                                                         \
-    const int M = (LP), K = (LP) + 1;                                                        \
-    const int nlv = 1 << M, mask = nlv - 1, kn = 1 << K;                                     \
-    const int nb = args.ne00 / QK_NEURON;                                                    \
-    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;                                      \
-    const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON;                                  \
-    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;                         \
-    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02              \
-                           + (i13/FC_mul_mv_r3)*args.nb03;                                   \
-    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12                   \
-                           + (i13        )*args.nb13;                                        \
-    device const block_neuron_m##LP * x =                                                    \
-        (device const block_neuron_m##LP *) (src0 + offset0);                                \
-    device const float * yy = (device const float *) (src1 + offset1);                       \
-    float sumf = 0.0f;                                                                        \
-    const int last = nlv - 1;                                                                \
-    /* Stride flat over the row's GROUPS, not over pairs within a block. Striding inside a
-       block ties lane utilisation to the block size: at QK_NEURON = 128 there are only 64
-       pairs, so `g = tiisg*8` left 24 of 32 lanes idle and generation ran 3.4x slower. */   \
-    const int gpb = QK_NEURON / 16;              /* 8-pair groups per block */               \
-    const int ngr = nb * gpb;                                                                \
-    for (int gg = tiisg; gg < ngr; gg += 32) {                                               \
-        const int ib = gg / gpb;                                                             \
-        const int g  = (gg - ib * gpb) * 8;                                                  \
-        {                                                                                    \
-            const float lo  = (float) x[ib].lo;                                              \
-            const float mid = (float) x[ib].mid;                                             \
-            const float hi  = (float) x[ib].hi;                                              \
-            device const float * yb = yy + ib * QK_NEURON;                                   \
-            device const uint8_t * qg = x[ib].qs + (g / 8) * (BITS);                         \
-            for (int t = 0; t < 8; ++t) {                                                    \
-                const int bit = t * (BITS);                                                  \
-                const uint c = ((uint)qg[bit >> 3] | ((uint)qg[(bit >> 3) + 1] << 8)         \
-                             | ((uint)qg[(bit >> 3) + 2] << 16)) >> (bit & 7);               \
-                const int code = (int)(c & ((1u << (BITS)) - 1u));                           \
-                const int mc = code & mask, ac = code >> M;                                  \
-                const float w = (float) mc / (float) last;                                   \
-                const float lr = w <= 0.5f ? lo + 2.0f*w*(mid - lo)                          \
-                                           : mid + (2.0f*w - 1.0f)*(hi - mid);               \
-                const float rv = exp(lr);                                                    \
-                const float th = (float) ac / (float) kn * 2.0f * M_PI_F - M_PI_F;           \
-                sumf += rv * (cos(th) * yb[2*(g+t)] + sin(th) * yb[2*(g+t)+1]);              \
-            }                                                                                \
-        }                                                                                    \
-    }                                                                                        \
-    const float tot = simd_sum(sumf);                                                        \
-    if (tiisg == 0) {                                                                        \
-        device float * dst_f32 = (device float *) dst                                        \
-            + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;                        \
-        dst_f32[first_row] = tot;                                                            \
-    }                                                                                        \
-}                                                                                            \
-                                                                                             \
-[[host_name("kernel_mul_mv_neuron_m" #LP "_f32")]]                                           \
-kernel void kernel_mul_mv_neuron_m##LP##_f32(                                                \
-        constant ggml_metal_kargs_mul_mv & args, device const char * src0,                   \
-        device const char * src1, device char * dst,                                         \
-        uint3 tgpig[[threadgroup_position_in_grid]],                                         \
-        ushort tiisg[[thread_index_in_simdgroup]],                                           \
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                                    \
-    kernel_mul_mv_neuron_m##LP##_f32_impl(args, src0, src1, dst, nullptr,                    \
-                                          tgpig, tiisg, sgitg);                              \
+// One GEMV for every layout. 16-pair / (4m+3)-byte groups, magnitudes in the first 2m
+// bytes, eight joint checkerboard angle codes of 2m+3 bits after them.
+//
+// Two ideas carry the speed. The angle depends on the CODE alone -- never on the block,
+// the row or the tensor -- so cos/sin are invariants of the whole kernel and come from the
+// constant table, never computed here. And the ladder is linear in log magnitude with an
+// integer code, so exp(ladder) is one native exp2(base + code*step).
+//
+// Unpacking the joint code is a serial chain: i = v >> JSH must retire before
+// j = 2*(v & JM) + (i&1) can start, and only then can the lookups issue. Where the joint
+// alphabet is small enough to stage (2^(2m+3) <= NEURON_MV_JMAX, i.e. m <= 3) a table
+// indexed by the code itself deletes that chain -- worth 19% at m3. Above that the table
+// would be 64 KB at m5 and 4 MB at m8, so those layouts pay the unpack. The table is
+// FILLED FROM THE CONSTANT GRID, never computed: calling cos/sin per entry cost 2048
+// transcendentals per threadgroup, which rivalled the matmul the threadgroup was there to
+// do.
+#define NEURON_MV_JMAX 512
+
+#define NEURON_MV_IMPL(LP)                                                                  \
+void kernel_mul_mv_neuron_m##LP##_f32_impl(                                                 \
+        constant ggml_metal_kargs_mul_mv & args,                                            \
+        device const char * src0, device const char * src1,                                 \
+        device char * dst, threadgroup char * shmem,                                        \
+        uint3 tgpig, ushort tiisg, ushort sgitg) {                                          \
+    const short NSG = FC_mul_mv_nsg;                                                        \
+    const int last = (1 << (LP)) - 1;                                                       \
+    const int AK = (LP) + 2, AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                      \
+    const int GBY = NEURON_GBY(LP), AOFF = NEURON_AOFF(LP);                                 \
+    const uint JM = (1u << JSH) - 1u;                                                       \
+    const int JST = 1 << AW;                                                                \
+    const int nb = args.ne00 / QK_NEURON;                                                   \
+    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;                                     \
+    const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON;                                 \
+    /* Two tables, one rule: stage whatever fits. Where the JOINT alphabet fits         \
+       (2^(2m+3) <= NEURON_MV_JMAX, i.e. m <= 3) the table is indexed by the code itself\
+       and one load serves both pairs. Above that the joint table cannot exist -- 64 KB at\
+       m5, 4 MB at m8 -- because entry v holds (trig[i], trig[j]) for two INDEPENDENT   \
+       indices, so a single load needs the full cross product. Those layouts stage the GRID\
+       instead: A = 2^(m+2) <= 1024 entries, at most 4 KB at every level. Two loads per \
+       pair-of-pairs, but both local rather than from constant space. */                \
+    threadgroup half4 * sang  = (threadgroup half4 *) shmem;                            \
+    threadgroup half2 * sgrid = (threadgroup half2 *) shmem;                            \
+    if (JST <= NEURON_MV_JMAX) {                                                        \
+        for (int v = 32*sgitg + tiisg; v < JST; v += 32*NSG) {                          \
+            const int ja = v >> JSH;                                                    \
+            const int jb = (int)(2*(v & JM)) + (ja & 1);                                \
+            const half2 ca = kNeuronAng[ja << (10 - AK)];                               \
+            const half2 cb = kNeuronAng[jb << (10 - AK)];                               \
+            sang[v] = half4(ca.x, ca.y, cb.x, cb.y);                                    \
+        }                                                                               \
+    } else {                                                                            \
+        for (int v = 32*sgitg + tiisg; v < (1 << AK); v += 32*NSG) {                    \
+            sgrid[v] = kNeuronAng[v << (10 - AK)];                                      \
+        }                                                                               \
+    }                                                                                   \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;                        \
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02             \
+                           + (i13/FC_mul_mv_r3)*args.nb03;                                  \
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12                  \
+                           + (i13        )*args.nb13;                                       \
+    device const block_neuron_m##LP * x =                                                   \
+        (device const block_neuron_m##LP *) (src0 + offset0);                               \
+    device const float * yy = (device const float *) (src1 + offset1);                      \
+    float sumf[N_R0_NEURON] = {0.0f};                                                       \
+    /* Stride WHOLE 16-pair groups. An 8-pair unit balances the 32 lanes better and         \
+       measured 10% SLOWER: each unit pays a fixed setup -- three 2-byte anchor loads plus  \
+       the base/step arithmetic -- and halving the unit doubles that per weight. */         \
+    const int gpb = QK_NEURON / (2 * NEURON_GRP);                                           \
+    const int ngr = nb * gpb;                                                               \
+    for (int gg = tiisg; gg < ngr; gg += 32) {                                              \
+        const int ib = gg / gpb;                                                            \
+        const int g  = gg - ib * gpb;                                                       \
+        device const float * yb = yy + ib*QK_NEURON + 2*g*NEURON_GRP;                       \
+        /* N_R0_NEURON output rows share this activation slice -- sharing that read is the  \
+           whole point of the second row. Weights and codes stay per row. */                \
+        FOR_UNROLL (short row = 0; row < N_R0_NEURON; ++row) {                              \
+            device const block_neuron_m##LP * xr = (device const block_neuron_m##LP *)      \
+                ((device const char *) x + row*args.nb01);                                  \
+            const float lo  = (float) xr[ib].lo;                                            \
+            const float mid = (float) xr[ib].mid;                                           \
+            const float hi  = (float) xr[ib].hi;                                            \
+            const float L   = M_LOG2E_F;                                                    \
+            const float b0 = lo * L,              s0 = 2.0f*(mid - lo)*L/(float) last;      \
+            const float b1 = (2.0f*mid - hi) * L, s1 = 2.0f*(hi - mid)*L/(float) last;      \
+            device const uint8_t * grp = xr[ib].qs + g*GBY;                                 \
+            device const uint8_t * ang = grp + AOFF;                                        \
+            FOR_UNROLL (int t = 0; t < NEURON_GRP/2; ++t) {                                 \
+                const int ba = t * AW;                                                      \
+                uint av = (uint) ang[ba >> 3];                                              \
+                if (((ba & 7) + AW) >  8) av |= (uint) ang[(ba >> 3) + 1] <<  8;            \
+                if (((ba & 7) + AW) > 16) av |= (uint) ang[(ba >> 3) + 2] << 16;            \
+                if (((ba & 7) + AW) > 24) av |= (uint) ang[(ba >> 3) + 3] << 24;            \
+                const uint v = (av >> (ba & 7)) & ((1u << AW) - 1u);                        \
+                half4 cs;                                                                   \
+                if (JST <= NEURON_MV_JMAX) {                                                \
+                    cs = sang[v];                                                           \
+                } else {                                                                    \
+                    const int ja = (int)(v >> JSH);                                         \
+                    const int jb = (int)(2u*(v & JM)) + (ja & 1);                           \
+                    const half2 ca = sgrid[ja];                                         \
+                    const half2 cb = sgrid[jb];                                         \
+                    cs = half4(ca.x, ca.y, cb.x, cb.y);                                     \
+                }                                                                           \
+                const int pa = 2*t, pb = pa + 1;                                            \
+                const int bma = pa * (LP), bmb = pb * (LP);                                 \
+                uint mva = (uint) grp[bma >> 3];                                            \
+                if (((bma & 7) + (LP)) > 8) mva |= (uint) grp[(bma >> 3) + 1] << 8;         \
+                uint mvb = (uint) grp[bmb >> 3];                                            \
+                if (((bmb & 7) + (LP)) > 8) mvb |= (uint) grp[(bmb >> 3) + 1] << 8;         \
+                const int ma = (int)((mva >> (bma & 7)) & (uint) last);                     \
+                const int mb = (int)((mvb >> (bmb & 7)) & (uint) last);                     \
+                const bool ua = (2*ma > last), ub = (2*mb > last);                          \
+                const float ra = exp2(fma((float) ma, ua ? s1 : s0, ua ? b1 : b0));         \
+                const float rb = exp2(fma((float) mb, ub ? s1 : s0, ub ? b1 : b0));         \
+                sumf[row] = fma(ra, (float) cs.x*yb[2*pa] + (float) cs.y*yb[2*pa+1], sumf[row]);\
+                sumf[row] = fma(rb, (float) cs.z*yb[2*pb] + (float) cs.w*yb[2*pb+1], sumf[row]);\
+            }                                                                               \
+        }                                                                                   \
+    }                                                                                       \
+    device float * dst_f32 = (device float *) dst                                           \
+        + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;                           \
+    for (short row = 0; row < N_R0_NEURON && first_row + row < args.ne0; ++row) {           \
+        const float tot = simd_sum(sumf[row]);                                              \
+        if (tiisg == 0) { dst_f32[first_row + row] = tot; }                                 \
+    }                                                                                       \
+}                                                                                           \
+                                                                                            \
+[[host_name("kernel_mul_mv_neuron_m" #LP "_f32")]]                                          \
+kernel void kernel_mul_mv_neuron_m##LP##_f32(                                               \
+        constant ggml_metal_kargs_mul_mv & args, device const char * src0,                  \
+        device const char * src1, device char * dst,                                        \
+        threadgroup char * shmem [[threadgroup(0)]],                                        \
+        uint3 tgpig[[threadgroup_position_in_grid]],                                        \
+        ushort tiisg[[thread_index_in_simdgroup]],                                          \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                                   \
+    kernel_mul_mv_neuron_m##LP##_f32_impl(args, src0, src1, dst, shmem,                     \
+                                          tgpig, tiisg, sgitg);                             \
 }
 
-NEURON_MV_IMPL(1,  3)
-NEURON_MV_IMPL(2,  5)
-NEURON_MV_IMPL(3,  7)
-NEURON_MV_IMPL(4,  9)
-NEURON_MV_IMPL(5, 11)
-NEURON_MV_IMPL(6, 13)
-NEURON_MV_IMPL(7, 15)
-NEURON_MV_IMPL(8, 17)
+NEURON_MV_IMPL(1)
+NEURON_MV_IMPL(2)
+NEURON_MV_IMPL(3)
+NEURON_MV_IMPL(4)
+NEURON_MV_IMPL(5)
+NEURON_MV_IMPL(6)
+NEURON_MV_IMPL(7)
+NEURON_MV_IMPL(8)

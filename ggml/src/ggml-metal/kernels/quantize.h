@@ -267,59 +267,79 @@ void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
 // median and max of the block's log magnitudes; median is taken by counting rather than
 // sorting, since a full sort of 64 values inside a kernel is not worth it and the anchor
 // only needs to land near the middle to give the ladder its bend.
-#define NEURON_QUANT(LP, BITS)                                                            \
+// KV encoder, one implementation for every layout. Mirrors the weight encoder's geometry
+// -- 16-pair / (4m+3)-byte groups, joint checkerboard angles -- but not its search: this
+// runs on every token written to the cache, so it takes the MEAN of the log magnitudes
+// rather than a true median (counting ranks was O(n^2) and cost 2.4x in generation), and
+// it does no refit.
+#define NEURON_QUANT(LP)                                                                    \
 void quantize_neuron_m##LP(device const float * src, device block_neuron_m##LP & dst) {   \
-    const int M = (LP), K = (LP) + 1;                                                     \
-    const int nlv = 1 << M, kn = 1 << K, last = nlv - 1, np = QK_NEURON / 2;              \
-    float lr[QK_NEURON / 2], th[QK_NEURON / 2];                                           \
+    const int nlv = 1 << (LP), last = nlv - 1, np = QK_NEURON / 2;                        \
+    const int A = NEURON_ANG(LP), AW = NEURON_AW(LP);                                     \
+    const int GBY = NEURON_GBY(LP), AOFF = NEURON_AOFF(LP), JSH = NEURON_JSH(LP);         \
+    float lr[QK_NEURON / 2], th[QK_NEURON / 2], rr[QK_NEURON / 2];                        \
     float lo = INFINITY, hi = -INFINITY;                                                  \
     for (int p = 0; p < np; ++p) {                                                        \
         const float a = src[2*p], b = src[2*p + 1];                                       \
         const float r = fmax(sqrt(a*a + b*b), 1e-30f);                                    \
+        rr[p] = r;                                                                        \
         lr[p] = log(r);                                                                   \
         th[p] = atan2(b, a);                                                              \
         lo = fmin(lo, lr[p]);                                                             \
         hi = fmax(hi, lr[p]);                                                             \
     }                                                                                     \
-    /* MEAN of the log magnitudes, not the median. The weight encoder takes a true median
-       because it runs once, offline; this runs on every token written to the cache, and
-       counting ranks was O(n^2) -- 4096 comparisons per block -- which cost 2.4x in
-       generation. The mean is O(n) and, for roughly log-normal magnitudes, lands close
-       enough: the anchor only has to sit near the middle to give the ladder its bend. */  \
     float mid = 0.0f;                                                                     \
     for (int p = 0; p < np; ++p) { mid += lr[p]; }                                        \
     mid /= (float) np;                                                                    \
     mid = clamp(mid, lo + 1e-4f, hi - 1e-4f);                                             \
     dst.lo = lo; dst.mid = mid; dst.hi = hi;                                              \
     const float flo = (float) dst.lo, fmi = (float) dst.mid, fhi = (float) dst.hi;        \
-    /* Pack into THREAD-local bytes, then write each byte to device memory exactly once.
-       Setting bits straight into dst.qs is a device read-modify-write PER BIT -- 704 of
-       them per block -- and that, not the anchor search, was what made the KV path 2.4x
-       slower than an f16 cache. 8 pairs fill exactly (BITS) bytes, so a group needs no
-       zeroing and no carry between groups. */                                            \
-    for (int g = 0; g < np; g += 8) {                                                     \
-        uint8_t buf[(BITS)];                                                              \
-        for (int i = 0; i < (BITS); ++i) { buf[i] = 0; }                                  \
-        for (int t = 0; t < 8; ++t) {                                                     \
-            const int p = g + t;                                                          \
-            int ac = (int) round((th[p] + M_PI_F) / (2.0f * M_PI_F) * kn);                \
-            ac = ((ac % kn) + kn) % kn;                                                    \
-            const float u = lr[p] <= fmi                                                   \
-                ? (lr[p] - flo) / fmax(2.0f*(fmi - flo), 1e-30f)                           \
-                : 0.5f + (lr[p] - fmi) / fmax(2.0f*(fhi - fmi), 1e-30f);                   \
-            const int mc = clamp((int) round(clamp(u, 0.0f, 1.0f) * last), 0, last);       \
-            const uint code = (uint)(ac * nlv + mc);                                       \
-            for (int i = 0; i < (BITS); ++i) {                                             \
-                const int bit = t * (BITS) + i;                                            \
-                if (code & (1u << i)) { buf[bit >> 3] |= (uint8_t)(1u << (bit & 7)); }     \
-            }                                                                              \
-        }                                                                                  \
-        for (int i = 0; i < (BITS); ++i) { dst.qs[(g / 8) * (BITS) + i] = buf[i]; }        \
-    }                                                                                      \
+    /* Pack into THREAD-local bytes, then write each byte to device memory exactly once.  \
+       Setting bits straight into dst.qs is a device read-modify-write PER BIT, and that, \
+       not the anchor search, is what made the KV path 2.4x slower than an f16 cache. */  \
+    for (int g = 0; g < np / NEURON_GRP; ++g) {                                           \
+        uint8_t buf[NEURON_GBY(LP)];                                                      \
+        for (int i = 0; i < GBY; ++i) { buf[i] = 0; }                                     \
+        const int p0 = g * NEURON_GRP;                                                    \
+        for (int t = 0; t < NEURON_GRP; ++t) {                                            \
+            const float l = lr[p0 + t];                                                   \
+            const float u = l <= fmi ? (l - flo) / fmax(2.0f*(fmi - flo), 1e-30f)         \
+                                     : 0.5f + (l - fmi) / fmax(2.0f*(fhi - fmi), 1e-30f); \
+            const int mc = clamp((int) round(clamp(u, 0.0f, 1.0f) * (float) last), 0, last);\
+            const int bit = t * (LP);                                                     \
+            for (int i = 0; i < (LP); ++i) {                                              \
+                if (mc & (1 << i)) { buf[(bit+i) >> 3] |= (uint8_t)(1u << ((bit+i) & 7)); }\
+            }                                                                             \
+        }                                                                                 \
+        for (int s = 0; s < NEURON_GRP / 2; ++s) {                                        \
+            const int pa = p0 + 2*s, pb = pa + 1;                                         \
+            const float ua = (th[pa] + M_PI_F) / (2.0f * M_PI_F) * (float) A;             \
+            const float ub = (th[pb] + M_PI_F) / (2.0f * M_PI_F) * (float) A;             \
+            int ia = (int) round(ua), ib = (int) round(ub);                               \
+            const float da = ua - (float) ia, db = ub - (float) ib;                       \
+            ia = ((ia % A) + A) % A;                                                      \
+            ib = ((ib % A) + A) % A;                                                      \
+            if ((ia + ib) & 1) {                                                          \
+                /* exact nearest point on the checkerboard: move whichever pair to its    \
+                   second-nearest grid point costs less. Angular error shows up as        \
+                   r*dtheta, so the squared cost changes by r^2 * (1 - 2|d|). */          \
+                const float ca = rr[pa]*rr[pa]*(1.0f - 2.0f*fabs(da));                    \
+                const float cb = rr[pb]*rr[pb]*(1.0f - 2.0f*fabs(db));                    \
+                if (ca <= cb) ia = ((ia + (da >= 0.0f ? 1 : -1)) % A + A) % A;            \
+                else          ib = ((ib + (db >= 0.0f ? 1 : -1)) % A + A) % A;            \
+            }                                                                             \
+            const uint v   = ((uint) ia << JSH) | ((uint) ib >> 1);                       \
+            const int  bit = AOFF*8 + s*AW;                                               \
+            for (int i = 0; i < AW; ++i) {                                                \
+                if (v & (1u << i)) { buf[(bit+i) >> 3] |= (uint8_t)(1u << ((bit+i) & 7)); }\
+            }                                                                             \
+        }                                                                                 \
+        for (int i = 0; i < GBY; ++i) { dst.qs[g*GBY + i] = buf[i]; }                     \
+    }                                                                                     \
 }
 
-NEURON_QUANT(3,  7)
-NEURON_QUANT(4,  9)
-NEURON_QUANT(5, 11)
-NEURON_QUANT(6, 13)
-NEURON_QUANT(7, 15)
+NEURON_QUANT(3)
+NEURON_QUANT(4)
+NEURON_QUANT(5)
+NEURON_QUANT(6)
+NEURON_QUANT(7)

@@ -57,8 +57,19 @@
 // Neuron pair codec: one row per simdgroup, lanes stride the row. Same shape as the
 // standalone kernel that measured 1.27x a plain matmul -- occupancy is what matters here,
 // an earlier one-thread-per-row version lost 3-14x.
-#define N_R0_NEURON 1
+#define N_R0_NEURON 2
 #define N_SG_NEURON 2
+// mul_mv staging for the neuron angle table: 2^K = 2^(m+1) entries of (cos, sin).
+// The angle depends only on the code, so this is built once per threadgroup and read
+// by every weight -- see NEURON_MV_IMPL in mul_mv.metal.
+// Joint angle table, staged only where it is small enough to be worth it: 2^(2m+3)
+// entries of half4. m<=3 fits in 4 KB; m5 would be 64 KB and m8 4 MB, so those layouts
+// unpack against the constant grid instead.
+#define NEURON_MV_JSTATES(LP) (1 << (2*(LP) + 3))
+#define NEURON_MV_SMEM(LP) (NEURON_MV_JSTATES(LP) <= 512 \
+                            ? NEURON_MV_JSTATES(LP) * 8      /* joint table, half4 */ \
+                            : (1 << ((LP) + 2)) * 4)         /* grid table,  half2 */
+// m3 codes angles on a 32-point grid (halved to 512 joint states), not 2^(m+1) = 16.
 
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2

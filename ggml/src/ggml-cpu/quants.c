@@ -1357,7 +1357,7 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
 // 3. THE ANGLE TABLE IS GLOBAL. A uniform circle grid of 2^k unit vectors is identical for
 //    every block, every tensor and every model, so it is built once rather than per block.
 
-#define NEURON_MAX_K 9          // m8 -> k = 9
+#define NEURON_MAX_K 10         // m8 grid A = 2^(m+2) = 1024
 static float neuron_ang[1 << NEURON_MAX_K][2];
 static int   neuron_ang_k = -1;
 
@@ -1400,57 +1400,71 @@ static inline uint32_t neuron_ld24(const uint8_t * p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
 }
 
-#define NEURON_CODE(BUF, J, W) \
-    ((neuron_ld24((BUF) + ((J) * (W)) / 8) >> (((J) * (W)) % 8)) & ((1u << (W)) - 1u))
+// Generic bit field access -- see ggml-quants.c. Reads only the bytes the field reaches.
+static inline uint32_t neuron_cbits(const uint8_t * GGML_RESTRICT qs, int bit, int nbits) {
+    const int by = bit >> 3, sh = bit & 7;
+    uint32_t v = (uint32_t) qs[by];
+    if (sh + nbits >  8) v |= (uint32_t) qs[by + 1] <<  8;
+    if (sh + nbits > 16) v |= (uint32_t) qs[by + 2] << 16;
+    if (sh + nbits > 24) v |= (uint32_t) qs[by + 3] << 24;
+    return (v >> sh) & ((1u << nbits) - 1u);
+}
 
-/* BITS must be passed in: it is a parameter of NEURON_VEC_DOT, so it is not substituted
-   inside a macro expanded from within it. */
-#define NEURON_TAP(J, W)                                                             \
-    {                                                                                \
-        const uint32_t c = NEURON_CODE(qs, J, W);                                    \
-        const float rv = mag[c & mask];                                              \
-        const float * u = neuron_ang_at((int)(c >> M), K);                           \
-        sum += rv * (u[0] * yg[2 * (J)] + u[1] * yg[2 * (J) + 1]);                   \
-    }
-
-#define NEURON_VEC_DOT(LP, BITS)                                                             \
+// One implementation for every layout: 16-pair / (4m+3)-byte groups, magnitudes in the
+// first 2m bytes, eight joint checkerboard angle codes of 2m+3 bits after them. The
+// magnitude ladder is built once per block as a GEOMETRIC sequence (two expf, not 2^m),
+// and the angle grid is a table -- this path vectorises poorly regardless, because NEON
+// has no gather, which is why it sits far behind the k-quants and why the GPU carries the
+// real work.
+#define NEURON_VEC_DOT(LP)                                                                   \
 void ggml_vec_dot_neuron_m##LP##_f32(int n, float * GGML_RESTRICT s, size_t bs,              \
                                      const void * GGML_RESTRICT vx, size_t bx,               \
                                      const void * GGML_RESTRICT vy, size_t by, int nrc) {    \
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);                     \
-    const int M = (LP), K = (LP) + 1;                                                        \
-    const int nlv = 1 << M, mask = nlv - 1;                                                  \
+    const int nlv = 1 << (LP);                                                               \
+    const int AK  = (LP) + 2;                    /* grid A = 2^(m+2)                    */   \
+    const int AW  = NEURON_AW(LP), GBY = NEURON_GBY(LP);                                     \
+    const int AOFF = NEURON_AOFF(LP), JSH = NEURON_JSH(LP);                                  \
+    const uint32_t JM = (1u << JSH) - 1u;                                                    \
     const block_neuron_m##LP * GGML_RESTRICT xb = vx;                                        \
     const float * GGML_RESTRICT y = vy;                                                      \
     const int nb = n / QK_NEURON;                                                            \
-    neuron_init_ang(K);                                                                      \
+    neuron_init_ang(AK);                                                                     \
     float mag[1 << 8];                                                                       \
     float sum = 0.0f;                                                                        \
     for (int i = 0; i < nb; ++i) {                                                           \
         neuron_mag_table(GGML_FP16_TO_FP32(xb[i].lo), GGML_FP16_TO_FP32(xb[i].mid),          \
                          GGML_FP16_TO_FP32(xb[i].hi), nlv, mag);                             \
-        const uint8_t * GGML_RESTRICT qs = xb[i].qs;                                 \
-        const float * yb = y + (size_t)i * QK_NEURON;                                \
-        /* one group = 8 pairs = exactly (BITS) bytes, fully unrolled */             \
-        for (int g = 0; g < QK_NEURON / 2; g += 8, qs += (BITS)) {                   \
-            const float * yg = yb + 2 * g;                                           \
-            NEURON_TAP(0, BITS) NEURON_TAP(1, BITS)                                  \
-            NEURON_TAP(2, BITS) NEURON_TAP(3, BITS)                                  \
-            NEURON_TAP(4, BITS) NEURON_TAP(5, BITS)                                  \
-            NEURON_TAP(6, BITS) NEURON_TAP(7, BITS)                                  \
-        }                                                                            \
+        const float * yb = y + (size_t)i * QK_NEURON;                                        \
+        for (int g = 0; g < QK_NEURON / (2 * NEURON_GRP); ++g) {                             \
+            const uint8_t * grp = xb[i].qs + (size_t)g * GBY;                                \
+            const uint8_t * ang = grp + AOFF;                                                \
+            const float * yg = yb + 2 * g * NEURON_GRP;                                      \
+            for (int t = 0; t < NEURON_GRP / 2; ++t) {                                       \
+                const uint32_t v = neuron_cbits(ang, t * AW, AW);                            \
+                const int ia = (int)(v >> JSH);                                              \
+                const int ib = (int)(2u * (v & JM)) + (ia & 1);                              \
+                const int pa = 2 * t, pb = pa + 1;                                           \
+                const float ra = mag[neuron_cbits(grp, pa * (LP), (LP))];                    \
+                const float rb = mag[neuron_cbits(grp, pb * (LP), (LP))];                    \
+                const float * ua = neuron_ang_at(ia, AK);                                    \
+                const float * ub = neuron_ang_at(ib, AK);                                    \
+                sum += ra * (ua[0] * yg[2*pa] + ua[1] * yg[2*pa + 1]);                       \
+                sum += rb * (ub[0] * yg[2*pb] + ub[1] * yg[2*pb + 1]);                       \
+            }                                                                                \
+        }                                                                                    \
     }                                                                                        \
     *s = sum;                                                                                \
 }
 
-NEURON_VEC_DOT(1,  3)
-NEURON_VEC_DOT(2,  5)
-NEURON_VEC_DOT(3,  7)
-NEURON_VEC_DOT(4,  9)
-NEURON_VEC_DOT(5, 11)
-NEURON_VEC_DOT(6, 13)
-NEURON_VEC_DOT(7, 15)
-NEURON_VEC_DOT(8, 17)
+NEURON_VEC_DOT(1)
+NEURON_VEC_DOT(2)
+NEURON_VEC_DOT(3)
+NEURON_VEC_DOT(4)
+NEURON_VEC_DOT(5)
+NEURON_VEC_DOT(6)
+NEURON_VEC_DOT(7)
+NEURON_VEC_DOT(8)
 
 // from_float wrappers, matching how every other quantised type exposes its encoder to the
 // CPU traits table. The reference encoder is plain round-to-nearest; the Python encoder is

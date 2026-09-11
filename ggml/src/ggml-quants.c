@@ -5831,86 +5831,246 @@ static inline uint32_t neuron_get(const uint8_t * qs, int idx, int bits) {
     return code;
 }
 
-#define NEURON_IMPL(LP, BITS)                                                                \
+// Generic bit field access. Widths run to 2m+3 = 19 bits, so a field can span four bytes
+// once its offset is counted. Each byte beyond the first is read ONLY when the field
+// actually reaches into it -- the offsets are compile-time constant at every call site
+// once the loops unroll, and an unconditional read would run past the final group of the
+// final block.
+static inline uint32_t neuron_bits(const uint8_t * GGML_RESTRICT qs, int bit, int nbits) {
+    const int by = bit >> 3, sh = bit & 7;
+    uint32_t v = (uint32_t) qs[by];
+    if (sh + nbits >  8) v |= (uint32_t) qs[by + 1] <<  8;
+    if (sh + nbits > 16) v |= (uint32_t) qs[by + 2] << 16;
+    if (sh + nbits > 24) v |= (uint32_t) qs[by + 3] << 24;
+    return (v >> sh) & ((1u << nbits) - 1u);
+}
+
+static inline void neuron_putbits(uint8_t * GGML_RESTRICT qs, int bit, int nbits, uint32_t c) {
+    for (int i = 0; i < nbits; ++i) {
+        const int b = bit + i;
+        if (c & (1u << i)) qs[b >> 3] |=  (uint8_t)(1u << (b & 7));
+        else               qs[b >> 3] &= (uint8_t)~(1u << (b & 7));
+    }
+}
+
+// Alternating refit. Round-to-nearest picks the pair of best codes; the best PAIR of codes
+// is a different thing, because a slightly worse angle can admit a much better magnitude.
+//
+//   E   reassign both codes together over 2 candidate angles x 3 candidate levels, under
+//       the checkerboard parity constraint that couples each pair to its neighbour
+//   M1  per-block least-squares scale, folded into the stored anchors -- the
+//       reconstruction is biased outward because E[cos(angle error)] < 1
+//
+// Objective is plain Frobenius. Weighting by r^-2 is scale-free but unbounded as r -> 0,
+// and was measured at 27.06 -> 30.19 perplexity at 4 bits: the relative behaviour the
+// model needs comes from coding magnitude in LOG space, not from the norm the levels are
+// fitted in. The Python M2 step (Newton on the shared level shape) is not ported -- it
+// moves a per-tensor `warp` table this format does not carry.
+//
+// ENCODER-ONLY: lo, mid and hi are written either way, so the format, both decoders and
+// every kernel are untouched. Its value scales with how much damage there is to undo --
+// measured at -1.7% perplexity at m3 and 0.0% at m5, where round-to-nearest is already
+// finding near-optimal codes.
+//
+// Angle candidates are loop-invariant (theta never moves), so they and log(r cos d) are
+// computed once up front and the iteration holds no trig at all.
+#define NEURON_FT_ITERS 16
+#define NEURON_MAXP (QK_NEURON / 2)
+
+static void neuron_refit_block(const float * GGML_RESTRICT rr,
+                               const float * GGML_RESTRICT th,
+                               int np, int nlv, int A,
+                               float * GGML_RESTRICT plo,
+                               float * GGML_RESTRICT pmid,
+                               float * GGML_RESTRICT phi,
+                               int * GGML_RESTRICT out_ac,
+                               int * GGML_RESTRICT out_mc) {
+    const int last = nlv - 1;
+    int   cand[NEURON_MAXP][2];
+    float ccd [NEURON_MAXP][2];
+    float clt [NEURON_MAXP][2];
+    for (int p = 0; p < np; ++p) {
+        const float ci = (th[p] + (float)M_PI) / (2.0f * (float)M_PI) * A;
+        const int   f0 = (int)floorf(ci);
+        for (int c = 0; c < 2; ++c) {
+            const int a = (((f0 + c) % A) + A) % A;      /* A is even: mod keeps parity */
+            const float cd =
+                cosf(th[p] - ((float)a / (float)A * 2.0f*(float)M_PI - (float)M_PI));
+            cand[p][c] = a;
+            ccd [p][c] = cd;
+            clt [p][c] = logf(fmaxf(rr[p] * cd, 1e-30f));
+        }
+    }
+    float lo  = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(*plo));
+    float mid = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(*pmid));
+    float hi  = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(*phi));
+    for (int it = 0; it < NEURON_FT_ITERS; ++it) {
+        float lvf[1 << 8];
+        for (int j = 0; j < nlv; ++j) {
+            lvf[j] = expf(neuron_ladder((float)j / (float)last, lo, mid, hi));
+        }
+        float num = 0.0f, den = 0.0f;
+        for (int s = 0; s < np / 2; ++s) {            /* one joint angle code per 2 pairs */
+            const int pa = 2*s, pb = pa + 1;
+            float bestsum = INFINITY;
+            int   ba = 0, bb = 0, bca = 0, bcb = 0;
+            float bAa = 0.0f, bAb = 0.0f, bra = 0.0f, brb = 0.0f;
+            for (int ca = 0; ca < 2; ++ca) {
+                for (int cb = 0; cb < 2; ++cb) {
+                    /* the checkerboard admits only the even-sum half of the grid */
+                    if ((cand[pa][ca] + cand[pb][cb]) & 1) continue;
+                    float ea = INFINITY, eb = INFINITY;
+                    int   ja = 0, jb = 0;
+                    float ra = 0.0f, rb = 0.0f;
+                    for (int w = 0; w < 2; ++w) {
+                        const int   p  = w ? pb : pa;
+                        const int   cx = w ? cb : ca;
+                        const float rc = rr[p], cd = ccd[p][cx];
+                        const float u  = neuron_coord(clt[p][cx], lo, mid, hi);
+                        int c0 = (int)lroundf(u * (float)last);
+                        if (c0 < 0) c0 = 0; if (c0 > last) c0 = last;
+                        for (int dl = -1; dl <= 1; ++dl) {
+                            int cc = c0 + dl;
+                            if (cc < 0) cc = 0; if (cc > last) cc = last;
+                            const float rq  = lvf[cc];
+                            const float err = rc*rc - 2.0f*rc*rq*cd + rq*rq;
+                            if (w == 0) { if (err < ea) { ea = err; ja = cc; ra = rq; } }
+                            else        { if (err < eb) { eb = err; jb = cc; rb = rq; } }
+                        }
+                    }
+                    if (ea + eb < bestsum) {
+                        bestsum = ea + eb;
+                        ba = cand[pa][ca]; bb = cand[pb][cb];
+                        bca = ja; bcb = jb;
+                        bAa = rr[pa]*ccd[pa][ca]; bAb = rr[pb]*ccd[pb][cb];
+                        bra = ra; brb = rb;
+                    }
+                }
+            }
+            out_ac[pa] = ba;  out_ac[pb] = bb;
+            out_mc[pa] = bca; out_mc[pb] = bcb;
+            num += bAa*bra + bAb*brb;
+            den += bra*bra + brb*brb;
+        }
+        float sc = den > 0.0f ? num / fmaxf(den, 1e-30f) : 1.0f;
+        if (sc < 0.5f) sc = 0.5f; if (sc > 2.0f) sc = 2.0f;
+        const float shift = logf(sc);
+        lo  = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(lo  + shift));
+        mid = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(mid + shift));
+        hi  = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(hi  + shift));
+        if (mid <= lo) mid = lo + 1e-4f;
+        if (mid >= hi) mid = hi - 1e-4f;
+    }
+    *plo = lo; *pmid = mid; *phi = hi;
+}
+
+static void neuron_encode_block(const float * GGML_RESTRICT xb, int LP,
+                                ggml_half * GGML_RESTRICT plo,
+                                ggml_half * GGML_RESTRICT pmid,
+                                ggml_half * GGML_RESTRICT phi,
+                                uint8_t * GGML_RESTRICT qs) {
+    const int np  = QK_NEURON / 2;
+    const int nlv = 1 << LP;
+    const int A   = NEURON_ANG(LP), AW = NEURON_AW(LP);
+    const int GBY = NEURON_GBY(LP), AOFF = NEURON_AOFF(LP), JSH = NEURON_JSH(LP);
+    float lr[NEURON_MAXP], th[NEURON_MAXP], rr[NEURON_MAXP];
+    float lo = INFINITY, hi = -INFINITY;
+    for (int p = 0; p < np; ++p) {
+        const float a = xb[2*p], b = xb[2*p + 1];
+        const float r = fmaxf(sqrtf(a*a + b*b), 1e-30f);
+        rr[p] = r;
+        lr[p] = logf(r);
+        th[p] = atan2f(b, a);
+        if (lr[p] < lo) lo = lr[p];
+        if (lr[p] > hi) hi = lr[p];
+    }
+    float srt[NEURON_MAXP];
+    memcpy(srt, lr, sizeof(float) * np);
+    for (int a = 1; a < np; ++a) {              /* insertion sort: median anchor */
+        float v = srt[a]; int b2 = a - 1;
+        while (b2 >= 0 && srt[b2] > v) { srt[b2 + 1] = srt[b2]; --b2; }
+        srt[b2 + 1] = v;
+    }
+    float mid = srt[np / 2];
+    if (mid <= lo) mid = lo + 1e-4f;
+    if (mid >= hi) mid = hi - 1e-4f;
+    int acs[NEURON_MAXP], mcs[NEURON_MAXP];
+    neuron_refit_block(rr, th, np, nlv, A, &lo, &mid, &hi, acs, mcs);
+    *plo = GGML_FP32_TO_FP16(lo);
+    *pmid = GGML_FP32_TO_FP16(mid);
+    *phi = GGML_FP32_TO_FP16(hi);
+    memset(qs, 0, (size_t)(QK_NEURON / 32) * GBY);
+    for (int g = 0; g < np / NEURON_GRP; ++g) {
+        uint8_t * grp = qs + (size_t)g * GBY;
+        uint8_t * ang = grp + AOFF;
+        const int p0 = g * NEURON_GRP;
+        for (int t = 0; t < NEURON_GRP; ++t) {
+            neuron_putbits(grp, t * LP, LP, (uint32_t)mcs[p0 + t]);
+        }
+        for (int t = 0; t < NEURON_GRP / 2; ++t) {
+            const int ia = acs[p0 + 2*t], ib = acs[p0 + 2*t + 1];
+            neuron_putbits(ang, t * AW, AW, ((uint32_t)ia << JSH) | ((uint32_t)ib >> 1));
+        }
+    }
+}
+
+static void neuron_decode_block(const uint8_t * GGML_RESTRICT qs, int LP,
+                                float lo, float mid, float hi,
+                                float * GGML_RESTRICT yb) {
+    const int np  = QK_NEURON / 2;
+    const int nlv = 1 << LP, last = nlv - 1;
+    const int A   = NEURON_ANG(LP), AW = NEURON_AW(LP);
+    const int GBY = NEURON_GBY(LP), AOFF = NEURON_AOFF(LP), JSH = NEURON_JSH(LP);
+    const uint32_t JM = (1u << JSH) - 1u;
+    for (int g = 0; g < np / NEURON_GRP; ++g) {
+        const uint8_t * grp = qs + (size_t)g * GBY;
+        const uint8_t * ang = grp + AOFF;
+        const int p0 = g * NEURON_GRP;
+        for (int t = 0; t < NEURON_GRP; ++t) {
+            const int p  = p0 + t;
+            const int mc = (int)neuron_bits(grp, t * LP, LP);
+            const uint32_t v = neuron_bits(ang, (t >> 1) * AW, AW);
+            const int ia = (int)(v >> JSH);
+            const int ac = (t & 1) ? (int)(2u*(v & JM)) + (ia & 1) : ia;
+            const float u  = (float)mc / (float)last;
+            const float r  = expf(neuron_ladder(u, lo, mid, hi));
+            const float t2 = (float)ac / (float)A * (2.0f*(float)M_PI) - (float)M_PI;
+            yb[2*p]     = r * cosf(t2);
+            yb[2*p + 1] = r * sinf(t2);
+        }
+    }
+}
+
+#define NEURON_IMPL(LP)                                                                      \
 void quantize_row_neuron_m##LP##_ref(const float * GGML_RESTRICT x,                          \
                                      block_neuron_m##LP * GGML_RESTRICT y, int64_t k) {      \
-    static const int M = (LP), K = (LP) + 1;                                                 \
-    const int nlv = 1 << M, kn = 1 << K;                                                     \
     const int nb = k / QK_NEURON;                                                            \
-    const int np = QK_NEURON / 2;                                                            \
     assert(k % QK_NEURON == 0);                                                              \
     for (int i = 0; i < nb; ++i) {                                                           \
-        const float * xb = x + (size_t)i * QK_NEURON;                                        \
-        float lr[QK_NEURON / 2], th[QK_NEURON / 2];                                          \
-        float lo = INFINITY, hi = -INFINITY;                                                 \
-        for (int p = 0; p < np; ++p) {                                                       \
-            const float a = xb[2 * p], b = xb[2 * p + 1];                                    \
-            const float r = fmaxf(sqrtf(a * a + b * b), 1e-30f);                             \
-            lr[p] = logf(r);                                                                 \
-            th[p] = atan2f(b, a);                                                            \
-            if (lr[p] < lo) lo = lr[p];                                                      \
-            if (lr[p] > hi) hi = lr[p];                                                      \
-        }                                                                                    \
-        float srt[QK_NEURON / 2];                                                            \
-        memcpy(srt, lr, sizeof(float) * np);                                                 \
-        for (int a = 1; a < np; ++a) {          /* insertion sort: median anchor */          \
-            float v = srt[a]; int b2 = a - 1;                                                \
-            while (b2 >= 0 && srt[b2] > v) { srt[b2 + 1] = srt[b2]; --b2; }                  \
-            srt[b2 + 1] = v;                                                                 \
-        }                                                                                    \
-        float mid = srt[np / 2];                                                             \
-        y[i].lo = GGML_FP32_TO_FP16(lo);                                                     \
-        y[i].hi = GGML_FP32_TO_FP16(hi);                                                     \
-        if (mid <= lo) mid = lo + 1e-4f;                                                     \
-        if (mid >= hi) mid = hi - 1e-4f;                                                     \
-        y[i].mid = GGML_FP32_TO_FP16(mid);                                                   \
-        const float flo = GGML_FP16_TO_FP32(y[i].lo);                                        \
-        const float fmi = GGML_FP16_TO_FP32(y[i].mid);                                       \
-        const float fhi = GGML_FP16_TO_FP32(y[i].hi);                                        \
-        memset(y[i].qs, 0, sizeof(y[i].qs));                                                 \
-        for (int p = 0; p < np; ++p) {                                                       \
-            int ac = (int)lroundf((th[p] + (float)M_PI) / (2.0f * (float)M_PI) * kn);        \
-            ac = ((ac % kn) + kn) % kn;                                                      \
-            const float u = neuron_coord(lr[p], flo, fmi, fhi);                              \
-            int mc = (int)lroundf(u * (nlv - 1));                                            \
-            if (mc < 0) mc = 0; if (mc > nlv - 1) mc = nlv - 1;                              \
-            neuron_put(y[i].qs, p, (uint32_t)(ac * nlv + mc), (BITS));                       \
-        }                                                                                    \
+        neuron_encode_block(x + (size_t)i * QK_NEURON, (LP),                                 \
+                            &y[i].lo, &y[i].mid, &y[i].hi, y[i].qs);                         \
     }                                                                                        \
 }                                                                                            \
                                                                                              \
 void dequantize_row_neuron_m##LP(const block_neuron_m##LP * GGML_RESTRICT x,                 \
                                  float * GGML_RESTRICT y, int64_t k) {                       \
-    static const int M = (LP), K = (LP) + 1;                                                 \
-    const int nlv = 1 << M, kn = 1 << K;                                                     \
     const int nb = k / QK_NEURON;                                                            \
-    const int np = QK_NEURON / 2;                                                            \
     assert(k % QK_NEURON == 0);                                                              \
     for (int i = 0; i < nb; ++i) {                                                           \
-        const float lo = GGML_FP16_TO_FP32(x[i].lo);                                         \
-        const float mid = GGML_FP16_TO_FP32(x[i].mid);                                       \
-        const float hi = GGML_FP16_TO_FP32(x[i].hi);                                         \
-        float * yb = y + (size_t)i * QK_NEURON;                                              \
-        for (int p = 0; p < np; ++p) {                                                       \
-            const uint32_t c = neuron_get(x[i].qs, p, (BITS));                               \
-            const int ac = (int)(c >> M), mc = (int)(c & (uint32_t)(nlv - 1));               \
-            const float u = (float)mc / (float)(nlv - 1);                                    \
-            const float r = expf(neuron_ladder(u, lo, mid, hi));                             \
-            const float t = (float)ac / (float)kn * (2.0f * (float)M_PI) - (float)M_PI;      \
-            yb[2 * p]     = r * cosf(t);                                                     \
-            yb[2 * p + 1] = r * sinf(t);                                                     \
-        }                                                                                    \
+        neuron_decode_block(x[i].qs, (LP), GGML_FP16_TO_FP32(x[i].lo),                       \
+                            GGML_FP16_TO_FP32(x[i].mid), GGML_FP16_TO_FP32(x[i].hi),         \
+                            y + (size_t)i * QK_NEURON);                                      \
     }                                                                                        \
 }
 
-NEURON_IMPL(1,  3)
-NEURON_IMPL(2,  5)
-NEURON_IMPL(3,  7)
-NEURON_IMPL(4,  9)
-NEURON_IMPL(5, 11)
-NEURON_IMPL(6, 13)
-NEURON_IMPL(7, 15)
-NEURON_IMPL(8, 17)
+NEURON_IMPL(1)
+NEURON_IMPL(2)
+NEURON_IMPL(3)
+NEURON_IMPL(4)
+NEURON_IMPL(5)
+NEURON_IMPL(6)
+NEURON_IMPL(7)
+NEURON_IMPL(8)
 
 // Row-wise entry points for ggml_quantize_chunk. It asserts the returned byte count equals
 // nrows * row_size, so these must return it -- a missing case here is what made the first

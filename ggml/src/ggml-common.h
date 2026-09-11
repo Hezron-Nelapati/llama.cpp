@@ -216,25 +216,47 @@ static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 b
 // packed little-endian across the block, as the odd-width k-quants do.
 #define QK_NEURON 128
 
-#define NEURON_BLOCK(LP, BITS)                                                    \
+// k = m + 1.5 at every level. A fractional bit needs a non-power-of-two alphabet, so the
+// angles of TWO pairs are coded jointly in 2m+3 bits -- 2^(2m+3) = (2^(m+1.5))^2, i.e.
+// exactly m+1.5 bits each. Those states are the checkerboard sublattice of an A x A grid,
+// A = 2^(m+2), keeping i+j even: A^2/2 = 2^(2m+3). Its second moment matches a uniform
+// 2^(m+1.5)-level quantiser, so the angle floor is pi/(2^(m+1.5) * sqrt(3)) -- a factor
+// 1/sqrt(2) below what k = m+1 can reach, for a flat +0.25 bits/weight.
+//
+//   pack     v = (i << (m+1)) | (j >> 1)
+//   unpack   i = v >> (m+1),  j = 2*(v & (2^(m+1) - 1)) + (i & 1)
+//
+// 16 pairs is the natural group: 16 magnitudes * m bits = 2m bytes, then 8 joint angles *
+// (2m+3) bits = 2m+3 bytes. Neither field ever straddles the other and the group is
+// 4m+3 bytes -- always ODD, so gcd(width, 8) = 1 survives at every level, which is the
+// property that made k = m+1 mandatory in the first place.
+#define NEURON_GRP       16                     /* pairs per group                      */
+#define NEURON_GBY(LP)   (4*(LP) + 3)           /* bytes per group                      */
+#define NEURON_AOFF(LP)  (2*(LP))               /* angle field offset within the group  */
+#define NEURON_AW(LP)    (2*(LP) + 3)           /* joint angle code width, in bits      */
+#define NEURON_ANG(LP)   (1 << ((LP) + 2))      /* grid A, before the checkerboard halving */
+#define NEURON_JSH(LP)   ((LP) + 1)             /* unpack shift                         */
+#define NEURON_ANGTAB    1024                   /* constant trig table: the m8 grid     */
+
+#define NEURON_BLOCK(LP)                                                          \
     typedef struct {                                                              \
         ggml_half lo;                                                             \
         ggml_half mid;                                                            \
         ggml_half hi;                                                             \
-        uint8_t   qs[(QK_NEURON / 2) * (BITS) / 8];                               \
+        uint8_t   qs[(QK_NEURON / 32) * NEURON_GBY(LP)];                          \
     } block_neuron_m##LP;                                                         \
     static_assert(sizeof(block_neuron_m##LP) ==                                   \
-                  3 * sizeof(ggml_half) + (QK_NEURON / 2) * (BITS) / 8,           \
+                  3 * sizeof(ggml_half) + (QK_NEURON / 32) * NEURON_GBY(LP),      \
                   "wrong block_neuron_m" #LP " size/padding");
 
-NEURON_BLOCK(1,  3)
-NEURON_BLOCK(2,  5)
-NEURON_BLOCK(3,  7)
-NEURON_BLOCK(4,  9)
-NEURON_BLOCK(5, 11)
-NEURON_BLOCK(6, 13)
-NEURON_BLOCK(7, 15)
-NEURON_BLOCK(8, 17)
+NEURON_BLOCK(1)
+NEURON_BLOCK(2)
+NEURON_BLOCK(3)
+NEURON_BLOCK(4)
+NEURON_BLOCK(5)
+NEURON_BLOCK(6)
+NEURON_BLOCK(7)
+NEURON_BLOCK(8)
 
 #define QK4_0 32
 typedef struct {
