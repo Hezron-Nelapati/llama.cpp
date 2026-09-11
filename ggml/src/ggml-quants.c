@@ -5578,7 +5578,119 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_K:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_K, data, nb, d, dmin);
+            } break;        case GGML_TYPE_NEURON_M1:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m1 * q = (const block_neuron_m1 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
             } break;
+        case GGML_TYPE_NEURON_M2:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m2 * q = (const block_neuron_m2 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M3:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m3 * q = (const block_neuron_m3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M4:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m4 * q = (const block_neuron_m4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M5:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m5 * q = (const block_neuron_m5 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M6:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m6 * q = (const block_neuron_m6 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M7:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m7 * q = (const block_neuron_m7 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_NEURON_M8:
+            {
+                // only the anchors can be invalid: every code is a bit pattern and every
+                // reachable value is exp() of a finite interpolation between them
+                const block_neuron_m8 * q = (const block_neuron_m8 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    const float lo  = GGML_FP16_TO_FP32(q[i].lo);
+                    const float mid = GGML_FP16_TO_FP32(q[i].mid);
+                    const float hi  = GGML_FP16_TO_FP32(q[i].hi);
+                    if (!isfinite(lo) || !isfinite(mid) || !isfinite(hi)) {
+                        return false;
+                    }
+                }
+            } break;
+
         case GGML_TYPE_Q5_K:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q5_K, data, nb, d, dmin);
@@ -5799,3 +5911,23 @@ NEURON_IMPL(5, 11)
 NEURON_IMPL(6, 13)
 NEURON_IMPL(7, 15)
 NEURON_IMPL(8, 17)
+
+// Row-wise entry points for ggml_quantize_chunk. It asserts the returned byte count equals
+// nrows * row_size, so these must return it -- a missing case here is what made the first
+// conversion abort on token_embd.
+#define NEURON_QUANTIZE(LP)                                                                \
+size_t quantize_neuron_m##LP(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,    \
+                             int64_t nrow, int64_t n_per_row,                              \
+                             const float * quant_weights) {                                \
+    GGML_UNUSED(quant_weights);                                                            \
+    const size_t row_size = ggml_row_size(GGML_TYPE_NEURON_M##LP, n_per_row);              \
+    char * qrow = (char *) dst;                                                            \
+    for (int64_t r = 0; r < nrow; ++r) {                                                   \
+        quantize_row_neuron_m##LP##_ref(src, (block_neuron_m##LP *) qrow, n_per_row);      \
+        src  += n_per_row;                                                                 \
+        qrow += row_size;                                                                  \
+    }                                                                                      \
+    return nrow * row_size;                                                                \
+}
+NEURON_QUANTIZE(1) NEURON_QUANTIZE(2) NEURON_QUANTIZE(3) NEURON_QUANTIZE(4)
+NEURON_QUANTIZE(5) NEURON_QUANTIZE(6) NEURON_QUANTIZE(7) NEURON_QUANTIZE(8)

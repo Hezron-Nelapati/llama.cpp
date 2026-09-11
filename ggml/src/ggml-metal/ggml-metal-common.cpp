@@ -7,9 +7,21 @@
 
 #include <vector>
 
+// The neuron types have no mul_mm kernel yet, only mul_mv. That kernel already loops over
+// columns through tgpig.y, so it is CORRECT at any batch size -- just slower than a real
+// GEMM for prompt processing. Decode, which is one column, takes the mv path regardless
+// and is unaffected.
+static bool ggml_metal_is_neuron_type(enum ggml_type t) {
+    return t >= GGML_TYPE_NEURON_M1 && t <= GGML_TYPE_NEURON_M8;
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
+
+    if (ggml_metal_is_neuron_type(op->src[0]->type)) {
+        return false;
+    }
 
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&

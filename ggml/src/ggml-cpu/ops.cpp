@@ -5163,6 +5163,14 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
+        case GGML_TYPE_NEURON_M1:
+        case GGML_TYPE_NEURON_M2:
+        case GGML_TYPE_NEURON_M3:
+        case GGML_TYPE_NEURON_M4:
+        case GGML_TYPE_NEURON_M5:
+        case GGML_TYPE_NEURON_M6:
+        case GGML_TYPE_NEURON_M7:
+        case GGML_TYPE_NEURON_M8:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:

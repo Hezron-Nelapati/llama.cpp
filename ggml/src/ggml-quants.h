@@ -119,6 +119,13 @@ GGML_API void iq3xs_free_impl(int grid_size);
                                                   int64_t k);                              \
     GGML_API void dequantize_row_neuron_m##LP(const block_neuron_m##LP * GGML_RESTRICT x,  \
                                               float * GGML_RESTRICT y, int64_t k);
+#define NEURON_QDECL(LP)                                                                   \
+    GGML_API size_t quantize_neuron_m##LP(const float * GGML_RESTRICT src,                 \
+                                          void * GGML_RESTRICT dst, int64_t nrow,          \
+                                          int64_t n_per_row, const float * quant_weights);
+NEURON_QDECL(1) NEURON_QDECL(2) NEURON_QDECL(3) NEURON_QDECL(4)
+NEURON_QDECL(5) NEURON_QDECL(6) NEURON_QDECL(7) NEURON_QDECL(8)
+
 NEURON_DECL(1) NEURON_DECL(2) NEURON_DECL(3) NEURON_DECL(4)
 NEURON_DECL(5) NEURON_DECL(6) NEURON_DECL(7) NEURON_DECL(8)
 
