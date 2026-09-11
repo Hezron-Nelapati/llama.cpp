@@ -1337,3 +1337,128 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// ============================================================================================
+// Neuron pair codec -- fused dot product
+//
+// THREE THINGS MAKE THIS FAST, and the reference path in ggml-quants.c does none of them.
+//
+// 1. BIT EXTRACTION IN GROUPS. Code width is 2m+1, always odd, so gcd(width, 8) = 1 and the
+//    packing pattern repeats every 8 pairs in exactly `width` bytes -- 8 pairs per 7 bytes
+//    at m3, per 11 at m5, per 15 at m7. A 64-bit window refills from memory and yields a
+//    code per shift-and-mask, against the reference's bit-at-a-time loop which costs 2m+1
+//    iterations per pair.
+//
+// 2. THE MAGNITUDE TABLE IS GEOMETRIC. Levels are uniform in the warp coordinate and the
+//    ladder is linear in LOG magnitude, so consecutive levels differ by a CONSTANT FACTOR
+//    within each segment. The table is therefore two expf calls and a running multiply,
+//    not 2^m expf calls -- at m7 that is 2 instead of 128 per block.
+//
+// 3. THE ANGLE TABLE IS GLOBAL. A uniform circle grid of 2^k unit vectors is identical for
+//    every block, every tensor and every model, so it is built once rather than per block.
+
+#define NEURON_MAX_K 9          // m8 -> k = 9
+static float neuron_ang[1 << NEURON_MAX_K][2];
+static int   neuron_ang_k = -1;
+
+static void neuron_init_ang(int k) {
+    if (neuron_ang_k >= k) return;
+    const int kn = 1 << NEURON_MAX_K;
+    for (int i = 0; i < kn; ++i) {
+        const float t = (float)i / (float)kn * 2.0f * (float)M_PI - (float)M_PI;
+        neuron_ang[i][0] = cosf(t);
+        neuron_ang[i][1] = sinf(t);
+    }
+    neuron_ang_k = NEURON_MAX_K;
+}
+
+// the angle table is built at the widest k; a narrower k strides it
+static inline const float * neuron_ang_at(int ac, int k) {
+    return neuron_ang[ac << (NEURON_MAX_K - k)];
+}
+
+static void neuron_mag_table(float lo, float mid, float hi, int nlv, float * out) {
+    const int last = nlv - 1;
+    const int jmid = last / 2;                       // largest j with w <= 0.5
+    const float slo = expf(2.0f * (mid - lo) / (float)last);
+    const float shi = expf(2.0f * (hi - mid) / (float)last);
+    float v = expf(lo);
+    for (int j = 0; j <= jmid; ++j) { out[j] = v; v *= slo; }
+    // upper segment: log r = mid + (2j - last)/last * (hi - mid)
+    v = expf(mid + (float)(2 * (jmid + 1) - last) / (float)last * (hi - mid));
+    for (int j = jmid + 1; j <= last; ++j) { out[j] = v; v *= shi; }
+}
+
+// 8 codes occupy exactly W bytes, because W = 2m+1 is odd so gcd(W, 8) = 1. That makes
+// every code's byte offset and shift a COMPILE-TIME CONSTANT once the group is unrolled --
+// no refill loop, no branches, no carried state. The first version kept a 64-bit window
+// with a `while (n < w)` refill and ran 13x slower than q5_K.
+//
+// W <= 17, so a code spans at most 3 bytes: 17 bits plus a 7-bit shift is 24. Three-byte
+// loads also mean the last group of the last block never reads past the allocation.
+static inline uint32_t neuron_ld24(const uint8_t * p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+
+#define NEURON_CODE(BUF, J, W) \
+    ((neuron_ld24((BUF) + ((J) * (W)) / 8) >> (((J) * (W)) % 8)) & ((1u << (W)) - 1u))
+
+/* BITS must be passed in: it is a parameter of NEURON_VEC_DOT, so it is not substituted
+   inside a macro expanded from within it. */
+#define NEURON_TAP(J, W)                                                             \
+    {                                                                                \
+        const uint32_t c = NEURON_CODE(qs, J, W);                                    \
+        const float rv = mag[c & mask];                                              \
+        const float * u = neuron_ang_at((int)(c >> M), K);                           \
+        sum += rv * (u[0] * yg[2 * (J)] + u[1] * yg[2 * (J) + 1]);                   \
+    }
+
+#define NEURON_VEC_DOT(LP, BITS)                                                             \
+void ggml_vec_dot_neuron_m##LP##_f32(int n, float * GGML_RESTRICT s, size_t bs,              \
+                                     const void * GGML_RESTRICT vx, size_t bx,               \
+                                     const void * GGML_RESTRICT vy, size_t by, int nrc) {    \
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);                     \
+    const int M = (LP), K = (LP) + 1;                                                        \
+    const int nlv = 1 << M, mask = nlv - 1;                                                  \
+    const block_neuron_m##LP * GGML_RESTRICT xb = vx;                                        \
+    const float * GGML_RESTRICT y = vy;                                                      \
+    const int nb = n / QK_NEURON;                                                            \
+    neuron_init_ang(K);                                                                      \
+    float mag[1 << 8];                                                                       \
+    float sum = 0.0f;                                                                        \
+    for (int i = 0; i < nb; ++i) {                                                           \
+        neuron_mag_table(GGML_FP16_TO_FP32(xb[i].lo), GGML_FP16_TO_FP32(xb[i].mid),          \
+                         GGML_FP16_TO_FP32(xb[i].hi), nlv, mag);                             \
+        const uint8_t * GGML_RESTRICT qs = xb[i].qs;                                 \
+        const float * yb = y + (size_t)i * QK_NEURON;                                \
+        /* one group = 8 pairs = exactly (BITS) bytes, fully unrolled */             \
+        for (int g = 0; g < QK_NEURON / 2; g += 8, qs += (BITS)) {                   \
+            const float * yg = yb + 2 * g;                                           \
+            NEURON_TAP(0, BITS) NEURON_TAP(1, BITS)                                  \
+            NEURON_TAP(2, BITS) NEURON_TAP(3, BITS)                                  \
+            NEURON_TAP(4, BITS) NEURON_TAP(5, BITS)                                  \
+            NEURON_TAP(6, BITS) NEURON_TAP(7, BITS)                                  \
+        }                                                                            \
+    }                                                                                        \
+    *s = sum;                                                                                \
+}
+
+NEURON_VEC_DOT(1,  3)
+NEURON_VEC_DOT(2,  5)
+NEURON_VEC_DOT(3,  7)
+NEURON_VEC_DOT(4,  9)
+NEURON_VEC_DOT(5, 11)
+NEURON_VEC_DOT(6, 13)
+NEURON_VEC_DOT(7, 15)
+NEURON_VEC_DOT(8, 17)
+
+// from_float wrappers, matching how every other quantised type exposes its encoder to the
+// CPU traits table. The reference encoder is plain round-to-nearest; the Python encoder is
+// the one that runs the alternating refit, and is what a shipped model is built with.
+#define NEURON_FROM_FLOAT(LP)                                                              \
+void quantize_row_neuron_m##LP(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,      \
+                               int64_t k) {                                                \
+    quantize_row_neuron_m##LP##_ref(x, (block_neuron_m##LP *) y, k);                       \
+}
+NEURON_FROM_FLOAT(1) NEURON_FROM_FLOAT(2) NEURON_FROM_FLOAT(3) NEURON_FROM_FLOAT(4)
+NEURON_FROM_FLOAT(5) NEURON_FROM_FLOAT(6) NEURON_FROM_FLOAT(7) NEURON_FROM_FLOAT(8)

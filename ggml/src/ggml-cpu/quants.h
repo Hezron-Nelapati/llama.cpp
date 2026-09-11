@@ -101,6 +101,22 @@ void ggml_vec_dot_iq1_m_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_iq4_xs_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
+
+// Neuron pair codec: vec_dot takes a FLOAT activation, not a quantised one -- the codec's
+// values are real (r*cos, r*sin), so the int8 path the k-quants use does not apply.
+#define NEURON_VD_DECL(LP)                                                                 \
+    void ggml_vec_dot_neuron_m##LP##_f32(int n, float * GGML_RESTRICT s, size_t bs,        \
+                                         const void * GGML_RESTRICT vx, size_t bx,         \
+                                         const void * GGML_RESTRICT vy, size_t by, int nrc);
+#define NEURON_FF_DECL(LP)                                                                 \
+    void quantize_row_neuron_m##LP(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,  \
+                                   int64_t k);
+NEURON_FF_DECL(1) NEURON_FF_DECL(2) NEURON_FF_DECL(3) NEURON_FF_DECL(4)
+NEURON_FF_DECL(5) NEURON_FF_DECL(6) NEURON_FF_DECL(7) NEURON_FF_DECL(8)
+
+NEURON_VD_DECL(1) NEURON_VD_DECL(2) NEURON_VD_DECL(3) NEURON_VD_DECL(4)
+NEURON_VD_DECL(5) NEURON_VD_DECL(6) NEURON_VD_DECL(7) NEURON_VD_DECL(8)
+
 #ifdef __cplusplus
 }
 #endif

@@ -318,6 +318,54 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_NEURON_M1] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m1,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m1_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M2] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m2,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m2_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M3] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m3,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M4] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m4,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m4_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M5] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m5,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m5_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M6] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m6,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m6_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M7] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m7,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m7_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_M8] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_m8,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_m8_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q5_K] = {
         .from_float               = quantize_row_q5_K,
         .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
