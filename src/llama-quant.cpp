@@ -869,6 +869,14 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_K_S:
         case LLAMA_FTYPE_MOSTLY_Q4_K_M:  return GGML_TYPE_Q4_K;
         case LLAMA_FTYPE_MOSTLY_Q5_K_S:
+        case LLAMA_FTYPE_MOSTLY_NEURON_M1: return GGML_TYPE_NEURON_M1;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M2: return GGML_TYPE_NEURON_M2;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M3: return GGML_TYPE_NEURON_M3;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M4: return GGML_TYPE_NEURON_M4;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M5: return GGML_TYPE_NEURON_M5;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M6: return GGML_TYPE_NEURON_M6;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M7: return GGML_TYPE_NEURON_M7;
+        case LLAMA_FTYPE_MOSTLY_NEURON_M8: return GGML_TYPE_NEURON_M8;
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;

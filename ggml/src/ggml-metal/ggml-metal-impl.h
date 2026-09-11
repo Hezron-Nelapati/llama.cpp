@@ -54,6 +54,12 @@
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
 
+// Neuron pair codec: one row per simdgroup, lanes stride the row. Same shape as the
+// standalone kernel that measured 1.27x a plain matmul -- occupancy is what matters here,
+// an earlier one-thread-per-row version lost 3-14x.
+#define N_R0_NEURON 1
+#define N_SG_NEURON 2
+
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2
 

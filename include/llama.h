@@ -157,6 +157,15 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
 
+        LLAMA_FTYPE_MOSTLY_NEURON_M1      = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M2      = 43, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M3      = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M4      = 45, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M5      = 46, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M6      = 47, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M7      = 48, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_M8      = 49, // except 1d tensors
+
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
 

@@ -3393,3 +3393,94 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+// ============================================================================================
+// Neuron pair codec
+//
+// One SIMDGROUP per output row, 32 lanes striding the row, simd_sum at the end. That shape
+// is load-bearing: an earlier version of this kernel gave one THREAD per row and measured
+// 3-14x SLOWER than a plain matmul. The defect was occupancy, not the fusing.
+//
+// Unlike the CPU path this vectorises fine, because the GPU gathers natively -- which is
+// exactly the operation NEON cannot do and why the CPU kernel sits 12x behind q5_K.
+//
+// Per block: the magnitude ladder is built once into threadgroup-free registers as a
+// GEOMETRIC sequence (levels are uniform in the warp coordinate and the ladder is linear
+// in log magnitude, so consecutive levels differ by a constant factor) -- two exp calls
+// rather than 2^m.
+
+#define NEURON_MV_IMPL(LP, BITS)                                                             \
+/* concrete args type, not the `args_t` template the k-quants use: this path serves
+   mul_mv only, and templating it would buy nothing but a second instantiation. */          \
+void kernel_mul_mv_neuron_m##LP##_f32_impl(                                                  \
+        constant ggml_metal_kargs_mul_mv & args,                                             \
+        device const char * src0, device const char * src1,                                  \
+        device char * dst, threadgroup char * shmem,                                         \
+        uint3 tgpig, ushort tiisg, ushort sgitg) {                                           \
+    const short NSG = FC_mul_mv_nsg;                                                         \
+    const int M = (LP), K = (LP) + 1;                                                        \
+    const int nlv = 1 << M, mask = nlv - 1, kn = 1 << K;                                     \
+    const int nb = args.ne00 / QK_NEURON;                                                    \
+    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;                                      \
+    const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON;                                  \
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;                         \
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02              \
+                           + (i13/FC_mul_mv_r3)*args.nb03;                                   \
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12                   \
+                           + (i13        )*args.nb13;                                        \
+    device const block_neuron_m##LP * x =                                                    \
+        (device const block_neuron_m##LP *) (src0 + offset0);                                \
+    device const float * yy = (device const float *) (src1 + offset1);                       \
+    float sumf = 0.0f;                                                                        \
+    for (int ib = 0; ib < nb; ++ib) {                                                        \
+        const float lo  = (float) x[ib].lo;                                                  \
+        const float mid = (float) x[ib].mid;                                                 \
+        const float hi  = (float) x[ib].hi;                                                  \
+        const int last = nlv - 1, jmid = last / 2;                                           \
+        device const uint8_t * qs = x[ib].qs;                                                \
+        device const float * yb = yy + ib * QK_NEURON;                                       \
+        /* 8 pairs occupy exactly (BITS) bytes: width is odd, so gcd(width,8) = 1 */         \
+        for (int g = tiisg * 8; g < QK_NEURON / 2; g += 32 * 8) {                            \
+            device const uint8_t * qg = qs + (g / 8) * (BITS);                               \
+            for (int t = 0; t < 8; ++t) {                                                    \
+                const int bit = t * (BITS);                                                  \
+                const uint c = ((uint)qg[bit >> 3] | ((uint)qg[(bit >> 3) + 1] << 8)         \
+                             | ((uint)qg[(bit >> 3) + 2] << 16)) >> (bit & 7);               \
+                const int code = (int)(c & ((1u << (BITS)) - 1u));                           \
+                const int mc = code & mask, ac = code >> M;                                  \
+                const float w = (float) mc / (float) last;                                   \
+                const float lr = w <= 0.5f ? lo + 2.0f*w*(mid - lo)                          \
+                                           : mid + (2.0f*w - 1.0f)*(hi - mid);               \
+                const float rv = exp(lr);                                                    \
+                const float th = (float) ac / (float) kn * 2.0f * M_PI_F - M_PI_F;           \
+                sumf += rv * (cos(th) * yb[2*(g+t)] + sin(th) * yb[2*(g+t)+1]);              \
+            }                                                                                \
+        }                                                                                    \
+    }                                                                                        \
+    const float tot = simd_sum(sumf);                                                        \
+    if (tiisg == 0) {                                                                        \
+        device float * dst_f32 = (device float *) dst                                        \
+            + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;                        \
+        dst_f32[first_row] = tot;                                                            \
+    }                                                                                        \
+}                                                                                            \
+                                                                                             \
+[[host_name("kernel_mul_mv_neuron_m" #LP "_f32")]]                                           \
+kernel void kernel_mul_mv_neuron_m##LP##_f32(                                                \
+        constant ggml_metal_kargs_mul_mv & args, device const char * src0,                   \
+        device const char * src1, device char * dst,                                         \
+        uint3 tgpig[[threadgroup_position_in_grid]],                                         \
+        ushort tiisg[[thread_index_in_simdgroup]],                                           \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                                    \
+    kernel_mul_mv_neuron_m##LP##_f32_impl(args, src0, src1, dst, nullptr,                    \
+                                          tgpig, tiisg, sgitg);                              \
+}
+
+NEURON_MV_IMPL(1,  3)
+NEURON_MV_IMPL(2,  5)
+NEURON_MV_IMPL(3,  7)
+NEURON_MV_IMPL(4,  9)
+NEURON_MV_IMPL(5, 11)
+NEURON_MV_IMPL(6, 13)
+NEURON_MV_IMPL(7, 15)
+NEURON_MV_IMPL(8, 17)

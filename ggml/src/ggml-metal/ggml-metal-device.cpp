@@ -917,6 +917,46 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
+        case GGML_TYPE_NEURON_M1:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M2:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M3:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M4:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M5:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M6:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M7:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M8:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
@@ -1197,6 +1237,46 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+            } break;
+        case GGML_TYPE_NEURON_M1:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M2:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M3:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M4:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M5:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M6:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M7:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
+            } break;
+        case GGML_TYPE_NEURON_M8:
+            {
+                nsg = N_SG_NEURON;
+                nr0 = N_R0_NEURON;
             } break;
         case GGML_TYPE_Q5_K:
             {
