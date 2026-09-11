@@ -430,7 +430,21 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // Neuron pair codec. A pair of weights is stored as a magnitude and a direction:
+        //   r = sqrt(a^2 + b^2) on a log ladder, theta = atan2(b, a) on a uniform circle.
+        // The suffix is the LAYOUT index m: k = m+1 angle bits and m magnitude bits, so
+        // k + m = 2m+1 bits per pair -- odd by construction, so a pair never fills whole
+        // bytes but a block always does. An embedding at parameter m uses the layout at
+        // m+1, which is why this family runs one past the weight range.
+        GGML_TYPE_NEURON_M1 = 43,
+        GGML_TYPE_NEURON_M2 = 44,
+        GGML_TYPE_NEURON_M3 = 45,
+        GGML_TYPE_NEURON_M4 = 46,
+        GGML_TYPE_NEURON_M5 = 47,
+        GGML_TYPE_NEURON_M6 = 48,
+        GGML_TYPE_NEURON_M7 = 49,
+        GGML_TYPE_NEURON_M8 = 50,
+        GGML_TYPE_COUNT   = 51,
     };
 
     // [TAG_GGML_PREC]

@@ -191,6 +191,42 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// Neuron pair codec ---------------------------------------------------------------------
+//
+// 512 values (256 pairs) per block. NOT 1024: ggml blocks a ROW and requires
+// ne[0] % blck_size == 0, and 1024 does not divide rows of 2560 or 9728. 512 divides every
+// row in every model tested, costing 0.094 bits/value for the anchors.
+//
+// Three fp16 anchors define a piecewise-linear ladder in LOG magnitude through lo, mid and
+// hi. `mid` is what lets the ladder BEND rather than only slide and stretch: lo and hi are
+// min and max, both tail statistics, and one outlier in a block otherwise spends every
+// level covering ground the rest of the block never occupies.
+//
+// Codes are joint (k+m)-bit values, angle in the high bits and magnitude in the low:
+//     code = acode * 2^m + mcode
+// packed little-endian across the block, as the odd-width k-quants do.
+#define QK_NEURON 512
+
+#define NEURON_BLOCK(LP, BITS)                                                    \
+    typedef struct {                                                              \
+        ggml_half lo;                                                             \
+        ggml_half mid;                                                            \
+        ggml_half hi;                                                             \
+        uint8_t   qs[(QK_NEURON / 2) * (BITS) / 8];                               \
+    } block_neuron_m##LP;                                                         \
+    static_assert(sizeof(block_neuron_m##LP) ==                                   \
+                  3 * sizeof(ggml_half) + (QK_NEURON / 2) * (BITS) / 8,           \
+                  "wrong block_neuron_m" #LP " size/padding");
+
+NEURON_BLOCK(1,  3)
+NEURON_BLOCK(2,  5)
+NEURON_BLOCK(3,  7)
+NEURON_BLOCK(4,  9)
+NEURON_BLOCK(5, 11)
+NEURON_BLOCK(6, 13)
+NEURON_BLOCK(7, 15)
+NEURON_BLOCK(8, 17)
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

@@ -110,6 +110,18 @@ GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);
 GGML_API void iq3xs_free_impl(int grid_size);
 
+
+// Neuron pair codec. One reference pair per layout; the bit width is the only difference,
+// so the bodies are generated from a single macro in ggml-quants.c.
+#define NEURON_DECL(LP)                                                                    \
+    GGML_API void quantize_row_neuron_m##LP##_ref(const float * GGML_RESTRICT x,           \
+                                                  block_neuron_m##LP * GGML_RESTRICT y,    \
+                                                  int64_t k);                              \
+    GGML_API void dequantize_row_neuron_m##LP(const block_neuron_m##LP * GGML_RESTRICT x,  \
+                                              float * GGML_RESTRICT y, int64_t k);
+NEURON_DECL(1) NEURON_DECL(2) NEURON_DECL(3) NEURON_DECL(4)
+NEURON_DECL(5) NEURON_DECL(6) NEURON_DECL(7) NEURON_DECL(8)
+
 #ifdef __cplusplus
 }
 #endif
