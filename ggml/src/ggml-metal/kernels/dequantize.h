@@ -1013,7 +1013,7 @@ template <typename type4x4>                                                     
 void dequantize_neuron_m##LP(device const block_neuron_m##LP *xb, short il,               \
                              thread type4x4 & reg) {                                      \
     const int last = (1 << (LP)) - 1;                                                     \
-    const int AK = (LP) + 2, AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                    \
+    const int AK = NEURON_AK(LP), AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);               \
     const uint JM = (1u << JSH) - 1u;                                                     \
     const float lo  = (float) xb->lo;                                                     \
     const float mid = (float) xb->mid;                                                    \
@@ -1065,3 +1065,34 @@ NEURON_DEQ(5)
 NEURON_DEQ(6)
 NEURON_DEQ(7)
 NEURON_DEQ(8)
+
+// neuron_v*. No ladder to rebuild and no grid to stride: a code is a direct index into the
+// codebook, so the whole per-block preamble is one fp16 read. `il` is a 16-value slice, so
+// it covers 8 pairs and each reg row takes two of them.
+#define NEURON_V_DEQ(SFX)                                                                 \
+template <typename type4x4>                                                               \
+void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,             \
+                              thread type4x4 & reg) {                                     \
+    const int B = NEURON_VQ##SFX##_BITS;                                                  \
+    const float d = (float) xb->d;                                                        \
+    device const uint8_t * qs = xb->qs;                                                   \
+    const short p0 = il * 8;                                                              \
+    FOR_UNROLL (short s = 0; s < 4; ++s) {                                                \
+        const short pa = p0 + 2*s, pb = pa + 1;                                           \
+        /* B=8 is a plain byte index; the second read would run off the end of qs */       \
+        const int  ba = pa * B, bb = pb * B;                                              \
+        const uint ca = B == 8 ? (uint) qs[pa]                                            \
+            : ((((uint) qs[ba >> 3]) | ((uint) qs[(ba >> 3) + 1] << 8))                   \
+               >> (ba & 7)) & (NEURON_VQ##SFX##_K - 1);                                   \
+        const uint cb = B == 8 ? (uint) qs[pb]                                            \
+            : ((((uint) qs[bb >> 3]) | ((uint) qs[(bb >> 3) + 1] << 8))                   \
+               >> (bb & 7)) & (NEURON_VQ##SFX##_K - 1);                                   \
+        reg[s][0] = d * kNeuronVQ##SFX[2*ca];                                             \
+        reg[s][1] = d * kNeuronVQ##SFX[2*ca + 1];                                         \
+        reg[s][2] = d * kNeuronVQ##SFX[2*cb];                                             \
+        reg[s][3] = d * kNeuronVQ##SFX[2*cb + 1];                                         \
+    }                                                                                     \
+}
+
+NEURON_V_DEQ(4)
+NEURON_V_DEQ(5)

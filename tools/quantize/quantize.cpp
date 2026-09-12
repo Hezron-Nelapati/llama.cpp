@@ -70,6 +70,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NEURON_M6", LLAMA_FTYPE_MOSTLY_NEURON_M6, "6.59 bpw, neuron pair codec", },
     { "NEURON_M7", LLAMA_FTYPE_MOSTLY_NEURON_M7, "7.59 bpw, neuron pair codec", },
     { "NEURON_M8", LLAMA_FTYPE_MOSTLY_NEURON_M8, "8.59 bpw, neuron pair codec", },
+    { "NEURON_V4", LLAMA_FTYPE_MOSTLY_NEURON_V4, "4.125 bpw, neuron d=2 VQ codec", },
+    { "NEURON_V5", LLAMA_FTYPE_MOSTLY_NEURON_V5, "5.125 bpw, neuron d=2 VQ codec", },
     { "Q5_K",     LLAMA_FTYPE_MOSTLY_Q5_K_M,   "alias for Q5_K_M",                  },
     { "Q5_K_S",   LLAMA_FTYPE_MOSTLY_Q5_K_S,   " 5.21G, +0.1049 ppl @ Llama-3-8B",  },
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },

@@ -398,6 +398,9 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            // neuron_v* are 128-block types; these are the nearest 32-block rates
+            case GGML_TYPE_NEURON_V4: return_type = GGML_TYPE_Q4_0; break;
+            case GGML_TYPE_NEURON_V5: return_type = GGML_TYPE_Q5_0; break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -877,6 +880,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_NEURON_M6: return GGML_TYPE_NEURON_M6;
         case LLAMA_FTYPE_MOSTLY_NEURON_M7: return GGML_TYPE_NEURON_M7;
         case LLAMA_FTYPE_MOSTLY_NEURON_M8: return GGML_TYPE_NEURON_M8;
+        case LLAMA_FTYPE_MOSTLY_NEURON_V4: return GGML_TYPE_NEURON_V4;
+        case LLAMA_FTYPE_MOSTLY_NEURON_V5: return GGML_TYPE_NEURON_V5;
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
         case LLAMA_FTYPE_MOSTLY_TQ1_0:   return GGML_TYPE_TQ1_0;

@@ -129,6 +129,20 @@ NEURON_QDECL(5) NEURON_QDECL(6) NEURON_QDECL(7) NEURON_QDECL(8)
 NEURON_DECL(1) NEURON_DECL(2) NEURON_DECL(3) NEURON_DECL(4)
 NEURON_DECL(5) NEURON_DECL(6) NEURON_DECL(7) NEURON_DECL(8)
 
+// Neuron VQ codec: one code per pair into a fixed codebook. The suffix selects the
+// codebook and code width; the bodies are generated from one macro in ggml-quants.c.
+#define NEURON_V_DECL(SFX)                                                                 \
+    GGML_API void   quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,        \
+                                                     block_neuron_v##SFX * GGML_RESTRICT y,\
+                                                     int64_t k);                           \
+    GGML_API void   dequantize_row_neuron_v##SFX(const block_neuron_v##SFX * GGML_RESTRICT x,\
+                                                 float * GGML_RESTRICT y, int64_t k);      \
+    GGML_API size_t quantize_neuron_v##SFX(const float * GGML_RESTRICT src,                \
+                                           void * GGML_RESTRICT dst, int64_t nrow,         \
+                                           int64_t n_per_row, const float * quant_weights);
+NEURON_V_DECL(4)
+NEURON_V_DECL(5)
+
 #ifdef __cplusplus
 }
 #endif

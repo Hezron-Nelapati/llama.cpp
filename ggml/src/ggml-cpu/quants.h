@@ -117,6 +117,16 @@ NEURON_FF_DECL(5) NEURON_FF_DECL(6) NEURON_FF_DECL(7) NEURON_FF_DECL(8)
 NEURON_VD_DECL(1) NEURON_VD_DECL(2) NEURON_VD_DECL(3) NEURON_VD_DECL(4)
 NEURON_VD_DECL(5) NEURON_VD_DECL(6) NEURON_VD_DECL(7) NEURON_VD_DECL(8)
 
+#define NEURON_V_VD_DECL(SFX)                                                              \
+    void ggml_vec_dot_neuron_v##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,       \
+                                          const void * GGML_RESTRICT vx, size_t bx,        \
+                                          const void * GGML_RESTRICT vy, size_t by,        \
+                                          int nrc);                                        \
+    void quantize_row_neuron_v##SFX(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, \
+                                    int64_t k);
+NEURON_V_VD_DECL(4)
+NEURON_V_VD_DECL(5)
+
 #ifdef __cplusplus
 }
 #endif

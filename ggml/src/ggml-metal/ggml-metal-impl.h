@@ -71,6 +71,22 @@
                             : (1 << ((LP) + 2)) * 4)         /* grid table,  half2 */
 // m3 codes angles on a 32-point grid (halved to 512 joint states), not 2^(m+1) = 16.
 
+// neuron_v* stages its whole codebook into threadgroup memory: K entries as half2, so
+// 1 KB at v4 and 4 KB at v5, both well inside the 32 KB budget. Staged rather than read
+// from constant space because every lane indexes a different code, and divergent
+// constant-space reads serialise -- the -45% "runtime-base lookup" tier. The staging is
+// itself a fixed per-dispatch cost, which is why the smaller table matters: see
+// NEURON_V_MV_IMPL in mul_mv.metal.
+// Spelled as literals because this header is processed before ggml-common.h in the Metal
+// include order, so NEURON_VQ*_K is not visible here.
+// v4's 256-entry table costs each thread 4 staging writes; v5's 1024 costs 16. Rows are
+// what pays for that, so the bigger table takes more of them per threadgroup.
+#define N_R0_NEURON_V4  2
+#define N_R0_NEURON_V5  8
+#define N_SG_NEURON_V   2
+#define NEURON_V4_SMEM  1024                   /*  256 half2 */
+#define NEURON_V5_SMEM  4096                   /* 1024 half2 */
+
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2
 

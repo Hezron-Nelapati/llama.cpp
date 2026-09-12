@@ -3435,7 +3435,7 @@ void kernel_mul_mv_neuron_m##LP##_f32_impl(                                     
         uint3 tgpig, ushort tiisg, ushort sgitg) {                                          \
     const short NSG = FC_mul_mv_nsg;                                                        \
     const int last = (1 << (LP)) - 1;                                                       \
-    const int AK = (LP) + 2, AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                      \
+    const int AK = NEURON_AK(LP), AW = NEURON_AW(LP), JSH = NEURON_JSH(LP);                 \
     const int GBY = NEURON_GBY(LP), AOFF = NEURON_AOFF(LP);                                 \
     const uint JM = (1u << JSH) - 1u;                                                       \
     const int JST = 1 << AW;                                                                \
@@ -3557,3 +3557,96 @@ NEURON_MV_IMPL(5)
 NEURON_MV_IMPL(6)
 NEURON_MV_IMPL(7)
 NEURON_MV_IMPL(8)
+
+// neuron_v* GEMV. The polar kernel's inner loop carried an exp2 per pair plus a bent-ladder
+// base/step recomputed per block; here a code is a direct table index, so the arithmetic per
+// weight is two fma and nothing else.
+//
+// The codebook is staged into threadgroup memory once per threadgroup because lanes index it
+// divergently, and divergent constant-space reads serialise. That staging is not free: v5
+// measured 9% BELOW q5 on generation while beating m5 by 7.6% on prompt, which is the shape
+// of a fixed per-dispatch cost amortised over too little work. v4's table is a quarter the
+// size (256 entries, 1 KB), so the same code pays a quarter of it.
+#define NEURON_V_MV_IMPL(SFX, STAGE)                                                               \
+void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                                \
+        constant ggml_metal_kargs_mul_mv & args,                                            \
+        device const char * src0, device const char * src1,                                 \
+        device char * dst, threadgroup char * shmem,                                        \
+        uint3 tgpig, ushort tiisg, ushort sgitg) {                                          \
+    const short NSG = FC_mul_mv_nsg;                                                        \
+    const int   B   = NEURON_VQ##SFX##_BITS;                                                \
+    const int   K   = NEURON_VQ##SFX##_K;                                                   \
+    const int nb = args.ne00 / QK_NEURON;                                                   \
+    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;                                     \
+    const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON_V##SFX;                               \
+    threadgroup half2 * svq = (threadgroup half2 *) shmem;                                  \
+    if (STAGE) {                                                                            \
+        for (int v = 32*sgitg + tiisg; v < K; v += 32*NSG) {                                \
+            svq[v] = half2((half) kNeuronVQ##SFX[2*v], (half) kNeuronVQ##SFX[2*v + 1]);     \
+        }                                                                                   \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
+    } else {                                                                                \
+        (void) shmem;                                                                       \
+    }                                                                                       \
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;                        \
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02             \
+                           + (i13/FC_mul_mv_r3)*args.nb03;                                  \
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12                  \
+                           + (i13        )*args.nb13;                                       \
+    device const block_neuron_v##SFX * x =                                                  \
+        (device const block_neuron_v##SFX *) (src0 + offset0);                              \
+    device const float * yy = (device const float *) (src1 + offset1);                      \
+    float sumf[N_R0_NEURON_V##SFX] = {0.0f};                                                     \
+    /* Stride 8-pair units. There is no per-unit setup to amortise -- the scale is one fp16 \
+       read and the codebook is already resident -- so the finer unit that measured 10%     \
+       slower for the polar layout costs nothing and balances the 32 lanes better. */       \
+    const int upb = QK_NEURON / 16;                                                         \
+    const int nu  = nb * upb;                                                               \
+    for (int uu = tiisg; uu < nu; uu += 32) {                                               \
+        const int ib = uu / upb;                                                            \
+        const int u  = uu - ib * upb;                                                       \
+        device const float * yb = yy + ib*QK_NEURON + u*16;                                 \
+        FOR_UNROLL (short row = 0; row < N_R0_NEURON_V##SFX; ++row) {                            \
+            device const block_neuron_v##SFX * xr = (device const block_neuron_v##SFX *)    \
+                ((device const char *) x + row*args.nb01);                                  \
+            const float d = (float) xr[ib].d;                                               \
+            device const uint8_t * qs = xr[ib].qs;                                          \
+            float acc = 0.0f;                                                               \
+            FOR_UNROLL (int t = 0; t < 8; ++t) {                                            \
+                const int  p  = u*8 + t;                                                    \
+                const int  bp = p * B;                                                      \
+                const uint c  = B == 8 ? (uint) qs[p]                                       \
+                    : ((((uint) qs[bp >> 3]) | ((uint) qs[(bp >> 3) + 1] << 8))             \
+                       >> (bp & 7)) & (K - 1);                                              \
+                const float2 cv = STAGE                                                     \
+                    ? float2(svq[c])                                                        \
+                    : float2(kNeuronVQ##SFX[2*c], kNeuronVQ##SFX[2*c + 1]);                 \
+                acc = fma(cv.x, yb[2*t],     acc);                                          \
+                acc = fma(cv.y, yb[2*t + 1], acc);                                          \
+            }                                                                               \
+            sumf[row] = fma(d, acc, sumf[row]);                                             \
+        }                                                                                   \
+    }                                                                                       \
+    device float * dst_f32 = (device float *) dst                                           \
+        + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;                           \
+    for (short row = 0; row < N_R0_NEURON_V##SFX && first_row + row < args.ne0; ++row) {         \
+        const float tot = simd_sum(sumf[row]);                                              \
+        if (tiisg == 0) { dst_f32[first_row + row] = tot; }                                  \
+    }                                                                                       \
+}                                                                                           \
+                                                                                            \
+[[host_name("kernel_mul_mv_neuron_v" #SFX "_f32")]]                                         \
+kernel void kernel_mul_mv_neuron_v##SFX##_f32(                                              \
+        constant ggml_metal_kargs_mul_mv & args, device const char * src0,                  \
+        device const char * src1, device char * dst,                                        \
+        threadgroup char * shmem [[threadgroup(0)]],                                        \
+        uint3 tgpig[[threadgroup_position_in_grid]],                                         \
+        ushort tiisg[[thread_index_in_simdgroup]],                                           \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                                    \
+    kernel_mul_mv_neuron_v##SFX##_f32_impl(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);\
+}
+
+/* v4's 256-entry table amortises 1:4 against the work and measured a clean win.
+   v5's 1024 entries amortise 1:1, so it reads from constant space instead. */
+NEURON_V_MV_IMPL(4, 1)
+NEURON_V_MV_IMPL(5, 1)

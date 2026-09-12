@@ -444,7 +444,12 @@ extern "C" {
         GGML_TYPE_NEURON_M6 = 48,
         GGML_TYPE_NEURON_M7 = 49,
         GGML_TYPE_NEURON_M8 = 50,
-        GGML_TYPE_COUNT   = 51,
+        // Neuron VQ codec. A pair of weights is one 10-bit index into a fixed codebook of
+        // 1024 points in the pair plane -- no parameterisation, no transcendental, one
+        // fp16 scale per block. The suffix is bits/value rounded down: v5 is 5.125.
+        GGML_TYPE_NEURON_V5 = 51,
+        GGML_TYPE_NEURON_V4 = 52,
+        GGML_TYPE_COUNT   = 53,
     };
 
     // [TAG_GGML_PREC]
