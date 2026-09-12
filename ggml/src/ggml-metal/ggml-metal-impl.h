@@ -84,8 +84,8 @@
 #define N_R0_NEURON_V4  2
 #define N_R0_NEURON_V5  8
 #define N_SG_NEURON_V   2
-#define NEURON_V4_SMEM  1024                   /*  256 half2 */
-#define NEURON_V5_SMEM  4096                   /* 1024 half2 */
+#define NEURON_V4_SMEM  (1024 + 64)             /*  256 half2 + 16 sub-block multipliers */
+#define NEURON_V5_SMEM  (4096 + 64)             /* 1024 half2 + 16 sub-block multipliers */
 
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2

@@ -3580,14 +3580,18 @@ void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                    
     const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;                                     \
     const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON_V##SFX;                               \
     threadgroup half2 * svq = (threadgroup half2 *) shmem;                                  \
+    /* the sub-block multiplier index comes from per-row data, so that constant-space read is\
+       divergent -- the -45% tier. 16 floats in threadgroup memory instead. */              \
+    threadgroup float * ssb = (threadgroup float *) (shmem + K*4);                          \
+    for (int v = 32*sgitg + tiisg; v < 16; v += 32*NSG) {                                   \
+        ssb[v] = kNeuronVQSB[v];                                                            \
+    }                                                                                       \
     if (STAGE) {                                                                            \
         for (int v = 32*sgitg + tiisg; v < K; v += 32*NSG) {                                \
             svq[v] = half2((half) kNeuronVQ##SFX[2*v], (half) kNeuronVQ##SFX[2*v + 1]);     \
         }                                                                                   \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                                    \
-    } else {                                                                                \
-        (void) shmem;                                                                       \
     }                                                                                       \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                        \
     const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;                        \
     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02             \
                            + (i13/FC_mul_mv_r3)*args.nb03;                                  \
@@ -3597,35 +3601,57 @@ void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                    
         (device const block_neuron_v##SFX *) (src0 + offset0);                              \
     device const float * yy = (device const float *) (src1 + offset1);                      \
     float sumf[N_R0_NEURON_V##SFX] = {0.0f};                                                     \
-    /* Stride 8-pair units. There is no per-unit setup to amortise -- the scale is one fp16 \
-       read and the codebook is already resident -- so the finer unit that measured 10%     \
-       slower for the polar layout costs nothing and balances the 32 lanes better. */       \
+    /* Stride 8-pair units: one unit is 8 pairs = 16 values = exactly one sub-block, so the \
+       sub-block multiplier is a per-unit constant and u indexes it directly.               \
+                                                                                            \
+       The activation slice is loaded ONCE per unit, into registers, before the row loop.   \
+       Sharing it across the N_R0 rows is the entire reason for coding more than one row per\
+       simdgroup, and the previous version did not actually do it -- yb is a device pointer \
+       the compiler cannot prove unaliased against dst, so it reloaded all 16 floats on every\
+       row. At N_R0 = 8 that was 112 redundant loads per unit. Four float4 loads now serve  \
+       all eight rows.                                                                      \
+                                                                                            \
+       Codes are read as ushorts rather than bytes. A unit holds 8*B bits = B bytes, so B/2 \
+       ushort loads replace up to 16 byte loads. Alignment holds: qs sits at offset 6 in the\
+       block, the unit offset is u*B, and both block strides (70 and 86) are even, so every \
+       address is 2-aligned. Code t needs at most two of those words -- at B=10 the worst   \
+       case is t=7, bit 70, offset 6, and 6+10 = 16 exactly -- so B/2 words always suffice  \
+       and nothing reads past the unit. */                                                  \
     const int upb = QK_NEURON / 16;                                                         \
     const int nu  = nb * upb;                                                               \
+    const int UW  = B / 2;                          /* ushorts per unit: 4 at v4, 5 at v5 */\
     for (int uu = tiisg; uu < nu; uu += 32) {                                               \
         const int ib = uu / upb;                                                            \
         const int u  = uu - ib * upb;                                                       \
-        device const float * yb = yy + ib*QK_NEURON + u*16;                                 \
-        FOR_UNROLL (short row = 0; row < N_R0_NEURON_V##SFX; ++row) {                            \
+        float2 yp[8];                                                                       \
+        {                                                                                   \
+            device const float4 * y4 =                                                      \
+                (device const float4 *) (yy + ib*QK_NEURON + u*16);                         \
+            FOR_UNROLL (short q = 0; q < 4; ++q) {                                          \
+                const float4 v = y4[q];                                                     \
+                yp[2*q + 0] = float2(v.x, v.y);                                             \
+                yp[2*q + 1] = float2(v.z, v.w);                                             \
+            }                                                                               \
+        }                                                                                   \
+        FOR_UNROLL (short row = 0; row < N_R0_NEURON_V##SFX; ++row) {                       \
             device const block_neuron_v##SFX * xr = (device const block_neuron_v##SFX *)    \
                 ((device const char *) x + row*args.nb01);                                  \
-            /* a strided unit is 8 pairs = 16 values = exactly one sub-block, so u is \
-               the sub-block index and its multiplier folds into the scale here, once */ \
-            const float d = (float) xr[ib].d \
-                          * kNeuronVQSB[(xr[ib].sb[u >> 1] >> ((u & 1) * 4)) & 0xF]; \
-            device const uint8_t * qs = xr[ib].qs;                                          \
+            const float d = (float) xr[ib].d                                                \
+                          * ssb[(xr[ib].sb[u >> 1] >> ((u & 1) * 4)) & 0xF];                \
+            device const ushort * qw = (device const ushort *) (xr[ib].qs + u * B);         \
+            ushort w[6] = {0, 0, 0, 0, 0, 0};                                               \
+            FOR_UNROLL (short q = 0; q < 6; ++q) { if (q < UW) { w[q] = qw[q]; } }          \
             float acc = 0.0f;                                                               \
             FOR_UNROLL (int t = 0; t < 8; ++t) {                                            \
-                const int  p  = u*8 + t;                                                    \
-                const int  bp = p * B;                                                      \
-                const uint c  = B == 8 ? (uint) qs[p]                                       \
-                    : ((((uint) qs[bp >> 3]) | ((uint) qs[(bp >> 3) + 1] << 8))             \
-                       >> (bp & 7)) & (K - 1);                                              \
+                const int  bt = t * B;                                                      \
+                uint       cw = (uint) w[bt >> 4];                                          \
+                if (((bt & 15) + B) > 16) { cw |= (uint) w[(bt >> 4) + 1] << 16; }          \
+                const uint c  = (cw >> (bt & 15)) & (K - 1);                                \
                 const float2 cv = STAGE                                                     \
                     ? float2(svq[c])                                                        \
                     : float2(kNeuronVQ##SFX[2*c], kNeuronVQ##SFX[2*c + 1]);                 \
-                acc = fma(cv.x, yb[2*t],     acc);                                          \
-                acc = fma(cv.y, yb[2*t + 1], acc);                                          \
+                acc = fma(cv.x, yp[t].x, acc);                                              \
+                acc = fma(cv.y, yp[t].y, acc);                                              \
             }                                                                               \
             sumf[row] = fma(d, acc, sumf[row]);                                             \
         }                                                                                   \
