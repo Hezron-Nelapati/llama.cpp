@@ -1074,26 +1074,31 @@ template <typename type4x4>                                                     
 void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,             \
                               thread type4x4 & reg) {                                     \
     const int B = NEURON_VQ##SFX##_BITS;                                                  \
-    /* il is a 16-value slice and a sub-block is 16 values, so il IS the sub-block index   \
-       and one multiplier serves the whole call */                                        \
+    /* il is a 16-value slice and a sub-block is 16 values, so il IS the sub-block index and\
+       one multiplier serves the whole call */                                            \
     const float d = (float) xb->d                                                         \
                   * kNeuronVQSB[(xb->sb[il >> 1] >> ((il & 1) * 4)) & 0xF];               \
-    device const uint8_t * qs = xb->qs;                                                   \
-    const short p0 = il * 8;                                                              \
+    /* One call covers 8 pairs = 8*B bits = B bytes, so B/2 ushort loads replace up to 16 \
+       byte loads. Same alignment argument as the GEMV: qs sits at offset 6, the slice offset\
+       is il*B, and both block strides are even, so every address is 2-aligned; and B/2 words\
+       always suffice, the worst case at B=10 being the last code at bit 70 offset 6 where\
+       6+10 = 16 exactly. This is the prompt path -- mul_mm reaches it, not mul_mv -- and v5\
+       needed it most, reading two bytes per pair against v4's one. */                    \
+    device const ushort * qw = (device const ushort *) (xb->qs + il * B);                 \
+    ushort w[6] = {0, 0, 0, 0, 0, 0};                                                     \
+    FOR_UNROLL (short q = 0; q < 6; ++q) { if (q < B/2) { w[q] = qw[q]; } }               \
     FOR_UNROLL (short s = 0; s < 4; ++s) {                                                \
-        const short pa = p0 + 2*s, pb = pa + 1;                                           \
-        /* B=8 is a plain byte index; the second read would run off the end of qs */       \
-        const int  ba = pa * B, bb = pb * B;                                              \
-        const uint ca = B == 8 ? (uint) qs[pa]                                            \
-            : ((((uint) qs[ba >> 3]) | ((uint) qs[(ba >> 3) + 1] << 8))                   \
-               >> (ba & 7)) & (NEURON_VQ##SFX##_K - 1);                                   \
-        const uint cb = B == 8 ? (uint) qs[pb]                                            \
-            : ((((uint) qs[bb >> 3]) | ((uint) qs[(bb >> 3) + 1] << 8))                   \
-               >> (bb & 7)) & (NEURON_VQ##SFX##_K - 1);                                   \
-        reg[s][0] = d * kNeuronVQ##SFX[2*ca];                                             \
-        reg[s][1] = d * kNeuronVQ##SFX[2*ca + 1];                                         \
-        reg[s][2] = d * kNeuronVQ##SFX[2*cb];                                             \
-        reg[s][3] = d * kNeuronVQ##SFX[2*cb + 1];                                         \
+        uint c[2];                                                                        \
+        FOR_UNROLL (short h = 0; h < 2; ++h) {                                            \
+            const int bt = (2*s + h) * B;                                                 \
+            uint      cw = (uint) w[bt >> 4];                                             \
+            if (((bt & 15) + B) > 16) { cw |= (uint) w[(bt >> 4) + 1] << 16; }            \
+            c[h] = (cw >> (bt & 15)) & (NEURON_VQ##SFX##_K - 1);                          \
+        }                                                                                 \
+        reg[s][0] = d * kNeuronVQ##SFX[2*c[0]];                                           \
+        reg[s][1] = d * kNeuronVQ##SFX[2*c[0] + 1];                                       \
+        reg[s][2] = d * kNeuronVQ##SFX[2*c[1]];                                           \
+        reg[s][3] = d * kNeuronVQ##SFX[2*c[1] + 1];                                       \
     }                                                                                     \
 }
 

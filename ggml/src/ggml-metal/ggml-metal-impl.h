@@ -79,9 +79,12 @@
 // NEURON_V_MV_IMPL in mul_mv.metal.
 // Spelled as literals because this header is processed before ggml-common.h in the Metal
 // include order, so NEURON_VQ*_K is not visible here.
-// v4's 256-entry table costs each thread 4 staging writes; v5's 1024 costs 16. Rows are
-// what pays for that, so the bigger table takes more of them per threadgroup.
-#define N_R0_NEURON_V4  2
+// Rows per simdgroup pay for two fixed per-dispatch costs: staging the codebook (4 staging
+// writes per thread at v4's 256 entries, 16 at v5's 1024) and, since the GEMV hoists it, the
+// activation slice -- four float4 loads amortised over N_R0 rows. v4 ran at 2 while v5 ran at
+// 8 and gained only +4.0% from the hoist against v5's +15.7%, having a quarter as many rows
+// to spread it over, so both now code 8.
+#define N_R0_NEURON_V4  8
 #define N_R0_NEURON_V5  8
 #define N_SG_NEURON_V   2
 #define NEURON_V4_SMEM  (1024 + 64)             /*  256 half2 + 16 sub-block multipliers */
