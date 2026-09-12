@@ -398,6 +398,20 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            // neuron: block size 128, so demote to the nearest 32-block type by bit rate.
+            // The codec pairs adjacent values, which is what ties it to a 128 block; a
+            // tensor whose ncols does not divide by 128 cannot carry it at all. In practice
+            // this fires only on oddly-shaped tensors (Qwen3.5's vision ffn_down is 4304
+            // wide), and 4304 does not divide by 32 either, so the check below takes those
+            // the rest of the way to F16.
+            case GGML_TYPE_NEURON_M1:
+            case GGML_TYPE_NEURON_M2:
+            case GGML_TYPE_NEURON_M3:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_NEURON_M4:   return_type = GGML_TYPE_Q5_0;   break;
+            case GGML_TYPE_NEURON_M5:   return_type = GGML_TYPE_Q5_1;   break;
+            case GGML_TYPE_NEURON_M6:
+            case GGML_TYPE_NEURON_M7:
+            case GGML_TYPE_NEURON_M8:   return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
