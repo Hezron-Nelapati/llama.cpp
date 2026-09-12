@@ -307,14 +307,41 @@ NEURON_BLOCK(8)
 #define NEURON_VQ5_BITS  10
 #define NEURON_VQ5_K     1024
 
+// One fp16 scale across 128 values is coarse: it is set by whichever outlier is largest, so
+// every quiet region of the block is coded against a scale far too big for it. Each block
+// therefore carries a 4-bit multiplier per 16-value sub-block, indexing kNeuronVQSB.
+//
+// Granularity is priced, not copied. MSE with per-sub-block scales over MSE with one scale
+// is mean_s (a_s/A)^2, so the error ratio is its square root at ~6.02 dB/bit, against one
+// 4-bit index per sub-block (experiments/fit_subscale.py):
+//
+//     sub-block   bits/val   err ratio   gain      NET
+//       8 values     0.500      0.6579   +0.604   +0.104
+//      16 values     0.250      0.7539   +0.408   +0.158   <- chosen
+//      32 values     0.125      0.8430   +0.246   +0.121   (Q_K's granularity)
+//      64 values     0.062      0.9250   +0.112   +0.050
+//
+// And 0.25 bits spent here buys 0.408 bits of error reduction where the same 0.25 spent on
+// a larger codebook buys ~0.25, the d=2 curve running at ~5.7 dB/bit -- about 1.6x more
+// bit-efficient, which is the actual argument for spending bits here rather than there.
+#define NEURON_VQ_SBV   16                              /* values per sub-block         */
+#define NEURON_VQ_NSB   (QK_NEURON / NEURON_VQ_SBV)     /* sub-blocks per block: 8      */
+#define NEURON_VQ_SBB   4                               /* bits per sub-block index     */
+#define NEURON_VQ_SBBY  (NEURON_VQ_NSB * NEURON_VQ_SBB / 8)   /* 4 bytes                */
+
 #define NEURON_V_BLOCK(SFX)                                                       \
     typedef struct {                                                              \
-        ggml_half d;                                 /* per-block scale        */ \
+        ggml_half d;                                 /* block scale            */ \
+        uint8_t   sb[NEURON_VQ_SBBY];                /* 8 x 4-bit multipliers  */ \
         uint8_t   qs[(QK_NEURON / 2) * NEURON_VQ##SFX##_BITS / 8];                \
     } block_neuron_v##SFX;                                                        \
     static_assert(sizeof(block_neuron_v##SFX) == sizeof(ggml_half) +              \
-                  (QK_NEURON / 2) * NEURON_VQ##SFX##_BITS / 8,                    \
+                  NEURON_VQ_SBBY + (QK_NEURON / 2) * NEURON_VQ##SFX##_BITS / 8,   \
                   "wrong block_neuron_v" #SFX " size/padding");
+// Pair p lives in sub-block s = p / (NEURON_VQ_SBV/2) = p/8, whose 4-bit multiplier index is
+// nibble s of sb[]:  (sb[s >> 1] >> ((s & 1) * 4)) & 0xF.  Spelled out at each use rather
+// than shared as a helper, because this header is also compiled as Metal, where a pointer
+// parameter needs an address-space qualifier and a generic one will not compile.
 
 NEURON_V_BLOCK(4)
 NEURON_V_BLOCK(5)
@@ -633,6 +660,16 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 #endif
 
 #if defined(GGML_COMMON_IMPL)
+
+// Sub-block scale multipliers, ratios of sub-block absmax to block absmax. Level 0 is
+// pinned to exactly 1.0 because by construction some sub-block attains the block
+// absmax -- that level is forced by the definition, not chosen. The other 15 are 1-D
+// Lloyd levels on the empirical ratio distribution, fitted in LOG space (constant
+// relative resolution is what a positive quantity of unknown scale wants). Mean
+// relative error of the grid: 1.62%. See experiments/fit_subscale.py.
+GGML_TABLE_BEGIN(float, kNeuronVQSB, 16)
+    +1.0000000f, +0.9291289f, +0.8907700f, +0.8449818f, +0.8070589f, +0.7777284f, +0.7499992f, +0.7236124f, +0.6915383f, +0.6621733f, +0.6293483f, +0.5985167f, +0.5515646f, +0.4777620f, +0.3698162f, +0.1773243f,
+GGML_TABLE_END()
 
 // The neuron_v4 codebook: 256 points in the pair plane, interleaved x,y. Same fit as
 // kNeuronVQ5 below -- 800k absmax-normalised pairs with their sign orbit, drawn from all

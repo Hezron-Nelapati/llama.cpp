@@ -1485,7 +1485,8 @@ void ggml_vec_dot_neuron_v##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                       const void * GGML_RESTRICT vx, size_t bx,              \
                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {   \
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);                     \
-    const int B = NEURON_VQ##SFX##_BITS;                                                     \
+    const int B   = NEURON_VQ##SFX##_BITS;                                                   \
+    const int PSB = NEURON_VQ_SBV / 2;                 /* pairs per sub-block: 8 */          \
     const block_neuron_v##SFX * GGML_RESTRICT xb = vx;                                       \
     const float * GGML_RESTRICT y = vy;                                                      \
     const int nb = n / QK_NEURON;                                                            \
@@ -1493,18 +1494,24 @@ void ggml_vec_dot_neuron_v##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,
     for (int i = 0; i < nb; ++i) {                                                           \
         const float d = GGML_FP16_TO_FP32(xb[i].d);                                          \
         const uint8_t * GGML_RESTRICT qs = xb[i].qs;                                         \
+        const uint8_t * GGML_RESTRICT sb = xb[i].sb;                                          \
         const float * yb = y + (size_t)i * QK_NEURON;                                        \
-        float acc = 0.0f;                                                                    \
-        for (int p = 0; p < QK_NEURON / 2; ++p) {                                            \
-            /* B=8 is a plain byte index: the second read would run off the end of qs */     \
-            const int      bit = p * B;                                                      \
-            const uint32_t c   = B == 8                                                      \
-                ? (uint32_t) qs[p]                                                           \
-                : ((((uint32_t) qs[bit >> 3]) | ((uint32_t) qs[(bit >> 3) + 1] << 8))        \
-                   >> (bit & 7)) & (NEURON_VQ##SFX##_K - 1u);                                \
-            acc += kNeuronVQ##SFX[2*c] * yb[2*p] + kNeuronVQ##SFX[2*c + 1] * yb[2*p + 1];    \
+        /* one multiplier per sub-block, hoisted out of the pair loop */                     \
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                   \
+            const float g = d * kNeuronVQSB[(sb[sblk >> 1] >> ((sblk & 1) * 4)) & 0xF];      \
+            float acc = 0.0f;                                                                \
+            for (int t = 0; t < PSB; ++t) {                                                  \
+                const int p = sblk*PSB + t;                                                  \
+                /* B=8 is a plain byte index: the second read would run off the end of qs */ \
+                const int      bit = p * B;                                                  \
+                const uint32_t c   = B == 8                                                  \
+                    ? (uint32_t) qs[p]                                                       \
+                    : ((((uint32_t) qs[bit >> 3]) | ((uint32_t) qs[(bit >> 3) + 1] << 8))    \
+                       >> (bit & 7)) & (NEURON_VQ##SFX##_K - 1u);                            \
+                acc += kNeuronVQ##SFX[2*c] * yb[2*p] + kNeuronVQ##SFX[2*c + 1] * yb[2*p + 1];\
+            }                                                                                \
+            sum += g * acc;                                                                  \
         }                                                                                    \
-        sum += d * acc;                                                                      \
     }                                                                                        \
     *s = sum;                                                                                \
 }                                                                                            \

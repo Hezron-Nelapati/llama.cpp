@@ -3609,7 +3609,10 @@ void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                    
         FOR_UNROLL (short row = 0; row < N_R0_NEURON_V##SFX; ++row) {                            \
             device const block_neuron_v##SFX * xr = (device const block_neuron_v##SFX *)    \
                 ((device const char *) x + row*args.nb01);                                  \
-            const float d = (float) xr[ib].d;                                               \
+            /* a strided unit is 8 pairs = 16 values = exactly one sub-block, so u is \
+               the sub-block index and its multiplier folds into the scale here, once */ \
+            const float d = (float) xr[ib].d \
+                          * kNeuronVQSB[(xr[ib].sb[u >> 1] >> ((u & 1) * 4)) & 0xF]; \
             device const uint8_t * qs = xr[ib].qs;                                          \
             float acc = 0.0f;                                                               \
             FOR_UNROLL (int t = 0; t < 8; ++t) {                                            \

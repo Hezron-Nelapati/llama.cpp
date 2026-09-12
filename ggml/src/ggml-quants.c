@@ -6125,6 +6125,24 @@ NEURON_QUANTIZE(5) NEURON_QUANTIZE(6) NEURON_QUANTIZE(7) NEURON_QUANTIZE(8)
 // trained to cover.
 //
 // ||C[c]||^2 is loop-invariant and shared by every block, so it is built once per type.
+// Two-level scale search. The block carries one fp16 scale and a 4-bit multiplier per
+// 16-value sub-block, so the encoder has to choose both, and they are not separable by
+// rounding: the best multiplier for a sub-block depends on which codewords are reachable at
+// that scale, and the best block scale depends on the multipliers chosen.
+//
+//   inner  for each sub-block, try ALL 16 multipliers and keep the one with the lowest
+//          summed squared error. Exhaustive over the representable set, so optimal given
+//          the block scale and the codebook -- no window, no step size, nothing to tune.
+//   outer  refit the block scale in closed form against the chosen multipliers and codes,
+//          then redo the inner pass.
+//
+//     argmin_c  ||x - g*C[c]||^2  ==  argmax_c  2*g*<x,C[c]> - g^2*||C[c]||^2
+//     d*        = sum <x, m_s*C[c]> / sum ||m_s*C[c]||^2
+//
+// The block scale is floored at the block absmax: the codebook is fitted on absmax-normalised
+// pairs and its coverage stops near radius 1.36 while such a pair reaches sqrt(2), so letting
+// the refit shrink d would push pairs outside the domain the codebook was fitted for.
+// ||C[c]||^2 is loop-invariant and shared by every block, so it is built once per type.
 #define NEURON_VQ_REFIT 2
 
 #define NEURON_V_IMPL(SFX)                                                                 \
@@ -6142,24 +6160,27 @@ static void neuron_vq##SFX##_init(void) {                                       
     g_vq##SFX##_ready = true;  /* idempotent: same values from every thread, no lock */    \
 }                                                                                          \
                                                                                            \
-static inline int neuron_vq##SFX##_nearest(float ax, float ay) {                           \
+/* best code for one pair at scale g, and the squared error it leaves behind */            \
+static inline int neuron_vq##SFX##_best(float ax, float ay, float g, float * GGML_RESTRICT e) { \
     int   best  = 0;                                                                       \
     float bestv = -INFINITY;                                                               \
     for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                         \
-        /* maximise 2<x,C> - ||C||^2, which is -||x-C||^2 up to the constant ||x||^2 */    \
-        const float v = 2.0f*(ax*kNeuronVQ##SFX[2*c] + ay*kNeuronVQ##SFX[2*c + 1])         \
-                      - g_vq##SFX##_cn[c];                                                 \
+        const float v = 2.0f*g*(ax*kNeuronVQ##SFX[2*c] + ay*kNeuronVQ##SFX[2*c + 1])       \
+                      - g*g*g_vq##SFX##_cn[c];                                             \
         if (v > bestv) {                                                                   \
             bestv = v;                                                                     \
             best  = c;                                                                     \
         }                                                                                  \
     }                                                                                      \
+    /* ||x - g*C||^2 = ||x||^2 - (2g<x,C> - g^2||C||^2) */                                 \
+    *e = ax*ax + ay*ay - bestv;                                                            \
     return best;                                                                           \
 }                                                                                          \
                                                                                            \
 void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,                       \
                                       block_neuron_v##SFX * GGML_RESTRICT y, int64_t k) {  \
     const int NP  = QK_NEURON / 2;                                                         \
+    const int PSB = NEURON_VQ_SBV / 2;                 /* pairs per sub-block: 8 */        \
     const int NBY = NP * NEURON_VQ##SFX##_BITS / 8;                                        \
     assert(k % QK_NEURON == 0);                                                            \
     const int nb = k / QK_NEURON;                                                          \
@@ -6171,26 +6192,53 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
             const float a = fabsf(xb[j]);                                                  \
             if (a > amax) amax = a;                                                        \
         }                                                                                  \
+        memset(y[i].sb, 0, NEURON_VQ_SBBY);                                                \
+        memset(y[i].qs, 0, NBY);                                                           \
         if (amax == 0.0f) {                                                                \
             y[i].d = GGML_FP32_TO_FP16(0.0f);                                              \
-            memset(y[i].qs, 0, NBY);                                                       \
             continue;                                                                      \
         }                                                                                  \
         int   cs[QK_NEURON / 2];                                                           \
+        int   mi[NEURON_VQ_NSB];                                                           \
         float d = amax;                                                                    \
         for (int it = 0; it <= NEURON_VQ_REFIT; ++it) {                                    \
-            const float inv = 1.0f / d;                                                    \
-            for (int p = 0; p < NP; ++p) {                                                 \
-                cs[p] = neuron_vq##SFX##_nearest(xb[2*p] * inv, xb[2*p + 1] * inv);        \
+            /* inner: exhaustive over the 16 representable multipliers, per sub-block */   \
+            for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                             \
+                int   bj = 0;                                                              \
+                float be = INFINITY;                                                       \
+                int   bc[NEURON_VQ_SBV / 2];                                               \
+                for (int j = 0; j < 16; ++j) {                                             \
+                    const float g = d * kNeuronVQSB[j];                                    \
+                    if (g <= 0.0f) {                                                       \
+                        continue;                                                          \
+                    }                                                                      \
+                    float tot = 0.0f;                                                      \
+                    int   tc[NEURON_VQ_SBV / 2];                                           \
+                    for (int t = 0; t < PSB; ++t) {                                        \
+                        const int p = sblk*PSB + t;                                        \
+                        float e;                                                           \
+                        tc[t] = neuron_vq##SFX##_best(xb[2*p], xb[2*p + 1], g, &e);        \
+                        tot += e;                                                          \
+                    }                                                                      \
+                    if (tot < be) {                                                        \
+                        be = tot;                                                          \
+                        bj = j;                                                            \
+                        for (int t = 0; t < PSB; ++t) bc[t] = tc[t];                       \
+                    }                                                                      \
+                }                                                                          \
+                mi[sblk] = bj;                                                             \
+                for (int t = 0; t < PSB; ++t) cs[sblk*PSB + t] = bc[t];                    \
             }                                                                              \
             if (it == NEURON_VQ_REFIT) {                                                   \
                 break;                                                                     \
             }                                                                              \
+            /* outer: closed-form block scale against the chosen multipliers and codes */  \
             float num = 0.0f, den = 0.0f;                                                  \
             for (int p = 0; p < NP; ++p) {                                                 \
-                num += xb[2*p]     * kNeuronVQ##SFX[2*cs[p]]                               \
-                     + xb[2*p + 1] * kNeuronVQ##SFX[2*cs[p] + 1];                          \
-                den += g_vq##SFX##_cn[cs[p]];                                              \
+                const float m = kNeuronVQSB[mi[p / PSB]];                                  \
+                num += m * (xb[2*p]     * kNeuronVQ##SFX[2*cs[p]]                          \
+                          + xb[2*p + 1] * kNeuronVQ##SFX[2*cs[p] + 1]);                    \
+                den += m * m * g_vq##SFX##_cn[cs[p]];                                      \
             }                                                                              \
             if (den <= 0.0f || num <= 0.0f) {                                              \
                 break;                       /* degenerate block; keep absmax */           \
@@ -6204,7 +6252,9 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
             d = dn;                                                                        \
         }                                                                                  \
         y[i].d = GGML_FP32_TO_FP16(d);                                                     \
-        memset(y[i].qs, 0, NBY);                                                           \
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                 \
+            y[i].sb[sblk >> 1] |= (uint8_t)(mi[sblk] << ((sblk & 1) * 4));                 \
+        }                                                                                  \
         for (int p = 0; p < NP; ++p) {                                                     \
             neuron_putbits(y[i].qs, p * NEURON_VQ##SFX##_BITS, NEURON_VQ##SFX##_BITS,      \
                            (uint32_t) cs[p]);                                              \
@@ -6215,15 +6265,18 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
 void dequantize_row_neuron_v##SFX(const block_neuron_v##SFX * GGML_RESTRICT x,             \
                                   float * GGML_RESTRICT y, int64_t k) {                    \
     assert(k % QK_NEURON == 0);                                                            \
-    const int nb = k / QK_NEURON;                                                          \
+    const int nb  = k / QK_NEURON;                                                         \
+    const int PSB = NEURON_VQ_SBV / 2;                                                     \
     for (int i = 0; i < nb; ++i) {                                                         \
         const float d = GGML_FP16_TO_FP32(x[i].d);                                         \
         float * yb = y + (size_t)i * QK_NEURON;                                            \
         for (int p = 0; p < QK_NEURON / 2; ++p) {                                          \
+            const int sblk = p / PSB;                                                      \
+            const float g = d * kNeuronVQSB[(x[i].sb[sblk >> 1] >> ((sblk & 1) * 4)) & 0xF]; \
             const uint32_t c = neuron_bits(x[i].qs, p * NEURON_VQ##SFX##_BITS,             \
                                            NEURON_VQ##SFX##_BITS);                         \
-            yb[2*p]     = d * kNeuronVQ##SFX[2*c];                                         \
-            yb[2*p + 1] = d * kNeuronVQ##SFX[2*c + 1];                                     \
+            yb[2*p]     = g * kNeuronVQ##SFX[2*c];                                         \
+            yb[2*p + 1] = g * kNeuronVQ##SFX[2*c + 1];                                     \
         }                                                                                  \
     }                                                                                      \
 }                                                                                          \

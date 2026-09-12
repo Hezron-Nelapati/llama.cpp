@@ -1074,7 +1074,10 @@ template <typename type4x4>                                                     
 void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,             \
                               thread type4x4 & reg) {                                     \
     const int B = NEURON_VQ##SFX##_BITS;                                                  \
-    const float d = (float) xb->d;                                                        \
+    /* il is a 16-value slice and a sub-block is 16 values, so il IS the sub-block index   \
+       and one multiplier serves the whole call */                                        \
+    const float d = (float) xb->d                                                         \
+                  * kNeuronVQSB[(xb->sb[il >> 1] >> ((il & 1) * 4)) & 0xF];               \
     device const uint8_t * qs = xb->qs;                                                   \
     const short p0 = il * 8;                                                              \
     FOR_UNROLL (short s = 0; s < 4; ++s) {                                                \
