@@ -902,27 +902,73 @@ static std::vector<float> llama_neuron_fit_codebook(
         w[i] /= (float) wmean;
     }
 
-    std::vector<int>    lab(n);
+    // The assignment step is n*K and dominates everything else: 4.9e10 distance evaluations
+    // at v5, 2.0e11 at v6. Two things make it affordable.
+    //
+    // argmin |x-c|^2 == argmax 2<x,c> - |c|^2, because |x|^2 is the same for every codeword.
+    // So the inner loop is a dot product against a per-iteration constant, and |x|^2 comes
+    // back only to report mse. This is the same identity the hull scale search uses.
+    //
+    // And points are independent, so the sweep splits across cores; each thread keeps its own
+    // accumulators and they are reduced once per iteration. The centroid update and the
+    // empty-cluster reseed stay on one thread, so the rng is consumed in the same order
+    // whatever the core count -- a fit must not depend on the machine it ran on.
+    const int nth = std::max(1, (int) std::thread::hardware_concurrency());
+    std::vector<std::vector<double>> t_cnt(nth, std::vector<double>(K));
+    std::vector<std::vector<double>> t_tot(nth, std::vector<double>(2 * (size_t) K));
+    std::vector<double> t_mse(nth);
+    std::vector<float>  cn(K);
     std::vector<double> cnt(K), tot(2 * (size_t) K);
     double mse = 0.0;
+
     for (int it = 0; it < ITERS; ++it) {
+        for (int c = 0; c < K; ++c) {
+            cn[c] = C[2*c]*C[2*c] + C[2*c + 1]*C[2*c + 1];
+        }
+
+        std::vector<std::thread> workers;
+        for (int t = 0; t < nth; ++t) {
+            const size_t lo = n * (size_t) t       / (size_t) nth;
+            const size_t hi = n * (size_t) (t + 1) / (size_t) nth;
+            std::fill(t_cnt[t].begin(), t_cnt[t].end(), 0.0);
+            std::fill(t_tot[t].begin(), t_tot[t].end(), 0.0);
+            t_mse[t] = 0.0;
+            workers.emplace_back([&, t, lo, hi]() {
+                double   * tc = t_cnt[t].data();
+                double   * tt = t_tot[t].data();
+                double     tm = 0.0;
+                const float * Cp  = C.data();
+                const float * cnp = cn.data();
+                for (size_t i = lo; i < hi; ++i) {
+                    const float x = P[2*i], y = P[2*i + 1];
+                    int   best = 0;
+                    float bs   = -INFINITY;
+                    for (int c = 0; c < K; ++c) {
+                        const float sc = 2.0f*(x*Cp[2*c] + y*Cp[2*c + 1]) - cnp[c];
+                        if (sc > bs) { bs = sc; best = c; }
+                    }
+                    tm += (double) (x*x + y*y) - (double) bs;   // |x-c|^2, recovered
+                    tc[best]       += w[i];
+                    tt[2*best]     += (double) x * w[i];
+                    tt[2*best + 1] += (double) y * w[i];
+                }
+                t_mse[t] = tm;
+            });
+        }
+        for (auto & th : workers) {
+            th.join();
+        }
+
         std::fill(cnt.begin(), cnt.end(), 0.0);
         std::fill(tot.begin(), tot.end(), 0.0);
         mse = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            const float x = P[2*i], y = P[2*i + 1];
-            int   best = 0;
-            float bd   = INFINITY;
+        for (int t = 0; t < nth; ++t) {
+            mse += t_mse[t];
             for (int c = 0; c < K; ++c) {
-                const float dx = x - C[2*c], dy = y - C[2*c + 1];
-                const float d  = dx*dx + dy*dy;
-                if (d < bd) { bd = d; best = c; }
+                cnt[c]       += t_cnt[t][c];
+                tot[2*c]     += t_tot[t][2*c];
+                tot[2*c + 1] += t_tot[t][2*c + 1];
             }
-            lab[i] = best;
-            mse   += bd;
-            cnt[best]       += w[i];
-            tot[2*best]     += (double) x * w[i];
-            tot[2*best + 1] += (double) y * w[i];
         }
         mse /= (double) n;
         for (int c = 0; c < K; ++c) {
