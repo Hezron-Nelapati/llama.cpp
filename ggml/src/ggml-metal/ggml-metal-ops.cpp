@@ -1,5 +1,9 @@
 #include "ggml-metal-ops.h"
 
+// QK_NEURON, NEURON_VQ_NSB, NEURON_VQ*_SBB for the neuron cpy dispatch below
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -2178,6 +2182,41 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
         nk0 = ne00/16;
     } else if (ggml_is_quantized(op->type)) {
         nk0 = ne00/ggml_blck_size(op->type);
+    }
+
+    // The neuron v* encoder gets a threadgroup per block rather than a thread: its lanes
+    // share the block and split the (sub-block, scale) grid between them, so no lane carries
+    // the whole ~65k-evaluation search on its own and the packing buffers sit in threadgroup
+    // memory instead of spilling out of registers.
+    switch (op->type) {
+        case GGML_TYPE_NEURON_V4:
+        case GGML_TYPE_NEURON_V5:
+        case GGML_TYPE_NEURON_V6: {
+            const int nsbt = 1 << (op->type == GGML_TYPE_NEURON_V6 ? NEURON_VQ6_SBB : NEURON_VQ5_SBB);
+            const size_t smem =
+                  QK_NEURON*sizeof(float)                      // the staged block
+                + NEURON_VQ_NSB*nsbt*sizeof(float)             // sse per (sub-block, scale)
+                + (QK_NEURON/2)*sizeof(uint16_t)               // chosen codes
+                + NEURON_VQ_NSB*sizeof(uint8_t);               // chosen multipliers
+
+            ggml_metal_kargs_cpy args_n = {
+                /*.nk0  =*/ nk0,
+                /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.ne03 =*/ ne03,
+                /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+                /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.ne2  =*/ ne2,  /*.ne3  =*/ ne3,
+                /*.nb0  =*/ nb0,  /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args_n, sizeof(args_n), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(smem, 16), 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, nk0, ne01, ne02*ne03, 32, 1, 1);
+            return 1;
+        }
+        default:
+            break;
     }
 
     int nth = std::min<int>(nk0*ne01, 256);

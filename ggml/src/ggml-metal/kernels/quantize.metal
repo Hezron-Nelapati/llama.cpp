@@ -100,12 +100,140 @@ template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_cpy_f32_tq2_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,   block_tq2_0,  quantize_tq2_0>;
-// Weight encoding on the GPU. These use the _ss variant, which searches the sub-block
-// multiplier rather than taking the nearest one -- the KV cache path keeps the cheap
-// encoder, because it pays per token and these pay once.
-template [[host_name("kernel_cpy_f32_neuron_v4")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v4, quantize_neuron_v4_ss>;
-template [[host_name("kernel_cpy_f32_neuron_v5")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v5, quantize_neuron_v5_ss>;
-template [[host_name("kernel_cpy_f32_neuron_v6")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v6, quantize_neuron_v6_ss>;
+// Weight encoding, one threadgroup per block, 32 lanes cooperating.
+//
+// The generic cpy kernel gives each thread a whole block, which on this codec means ~65k
+// codeword evaluations serially in one lane. Two things go wrong with that even though
+// millions of threads are in flight: qbuf/sbuf are dynamically indexed local arrays, so they
+// spill out of registers and cut how many threads stay resident; and each lane of a SIMD
+// group is on a different block with a different annulus walk length, so the group runs at
+// its slowest lane.
+//
+// Here the lanes share a block. Each takes a slice of the (sub-block, scale) grid, so the
+// work per lane is ~1/32 and near-uniform, and the packing buffers live in threadgroup
+// memory instead of per-thread.
+#define NEURON_V_CPY(SFX)                                                                 \
+kernel void kernel_cpy_f32_neuron_v##SFX(                                                 \
+        constant ggml_metal_kargs_cpy & args,                                             \
+        device const char * src0,                                                         \
+        device       char * dst,                                                          \
+        threadgroup char  * shmem [[threadgroup(0)]],                                     \
+        uint3  tgpig[[threadgroup_position_in_grid]],                                     \
+        ushort tiisg[[thread_index_in_threadgroup]]) {                                    \
+    const int NP   = QK_NEURON / 2;                                                       \
+    const int PSB  = NEURON_VQ_SBV / 2;                                                   \
+    const int B    = NEURON_VQ##SFX##_BITS;                                               \
+    const int SBB  = NEURON_VQ##SFX##_SBB;                                                \
+    const int NSBT = 1 << SBB;                                                            \
+    const int NSB  = NEURON_VQ_NSB;                                                       \
+                                                                                          \
+    threadgroup float  * sv  = (threadgroup float  *) shmem;                              \
+    threadgroup float  * sse = (threadgroup float  *) (shmem + QK_NEURON*4);              \
+    threadgroup ushort * cds = (threadgroup ushort *) (shmem + QK_NEURON*4 + NSB*NSBT*4); \
+    threadgroup uchar  * smj = (threadgroup uchar  *) (shmem + QK_NEURON*4 + NSB*NSBT*4 + NP*2); \
+                                                                                          \
+    const int64_t ib  = tgpig.x;                  /* block within the row */              \
+    const int64_t i01 = tgpig.y;                                                          \
+    const int64_t i02 = tgpig.z % args.ne02;                                              \
+    const int64_t i03 = tgpig.z / args.ne02;                                              \
+    if (ib >= args.nk0 || i01 >= args.ne01) { return; }                                   \
+                                                                                          \
+    device const float * src = (device const float *)(src0 + i03*args.nb03 + i02*args.nb02 \
+                                                    + i01*args.nb01) + ib*QK_NEURON;      \
+    device block_neuron_v##SFX * pd = (device block_neuron_v##SFX *)                       \
+        (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1) + ib;                          \
+                                                                                          \
+    /* stage the block and take its absmax across the group */                            \
+    float a = 0.0f;                                                                       \
+    for (int j = tiisg; j < QK_NEURON; j += 32) {                                          \
+        const float v = src[j];                                                           \
+        sv[j] = v;                                                                        \
+        a = fmax(a, fabs(v));                                                             \
+    }                                                                                     \
+    a = simd_max(a);                                                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                          \
+    if (a == 0.0f) {                                                                      \
+        if (tiisg == 0) {                                                                 \
+            pd->d = (half) 0.0f;                                                          \
+            for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { pd->sb[i] = 0; }              \
+            for (int i = 0; i < NP * B / 8; ++i) { pd->qs[i] = 0; }                       \
+        }                                                                                 \
+        return;                                                                           \
+    }                                                                                     \
+    const half  dh = (half) a;                                                            \
+    const float d  = (float) dh;                                                          \
+                                                                                          \
+    /* one lane per (sub-block, scale); each lane walks its own slice of the grid */       \
+    for (int u = tiisg; u < NSB*NSBT; u += 32) {                                           \
+        const int sblk = u / NSBT;                                                        \
+        const int j    = u % NSBT;                                                        \
+        const float gj = d * NEURON_VQ##SFX##_SBT[j];                                     \
+        float acc = INFINITY;                                                             \
+        if (gj > 0.0f) {                                                                  \
+            const float ij = 1.0f / gj;                                                   \
+            acc = 0.0f;                                                                   \
+            for (int t = 0; t < PSB; ++t) {                                               \
+                const int   p  = sblk*PSB + t;                                            \
+                const float ax = sv[2*p] * ij, ay = sv[2*p + 1] * ij;                     \
+                float d2 = 0.0f;                                                          \
+                neuron_vq##SFX##_nn_gpu(ax, ay, d2);                                      \
+                acc += d2 * gj * gj;                                                      \
+            }                                                                             \
+        }                                                                                 \
+        sse[u] = acc;                                                                     \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                          \
+    /* pick each sub-block's multiplier */                                                \
+    if (tiisg < NSB) {                                                                    \
+        int   mj = 0;                                                                     \
+        float mb = INFINITY;                                                              \
+        for (int j = 0; j < NSBT; ++j) {                                                  \
+            const float e = sse[tiisg*NSBT + j];                                          \
+            if (e < mb) { mb = e; mj = j; }                                               \
+        }                                                                                 \
+        smj[tiisg] = (uchar) mj;                                                          \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                          \
+    /* encode the pairs at the chosen scales */                                           \
+    for (int p = tiisg; p < NP; p += 32) {                                                 \
+        const int   sblk = p / PSB;                                                       \
+        const float g    = d * NEURON_VQ##SFX##_SBT[smj[sblk]];                           \
+        const float inv  = g > 0.0f ? 1.0f / g : 0.0f;                                    \
+        const float ax   = sv[2*p] * inv, ay = sv[2*p + 1] * inv;                         \
+        float d2 = 0.0f;                                                                  \
+        cds[p] = (ushort) neuron_vq##SFX##_nn_gpu(ax, ay, d2);                            \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+                                                                                          \
+    /* one lane packs: the bit fields straddle bytes, so this stays serial */             \
+    if (tiisg == 0) {                                                                     \
+        pd->d = dh;                                                                       \
+        for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { pd->sb[i] = 0; }                  \
+        for (int i = 0; i < NP * B / 8; ++i) { pd->qs[i] = 0; }                           \
+        for (int sblk = 0; sblk < NSB; ++sblk) {                                           \
+            const int mj = smj[sblk];                                                     \
+            const int sbit = sblk * SBB;                                                  \
+            pd->sb[sbit >> 3] |= (uint8_t)(mj << (sbit & 7));                             \
+            if (((sbit & 7) + SBB) > 8) {                                                 \
+                pd->sb[(sbit >> 3) + 1] |= (uint8_t)(mj >> (8 - (sbit & 7)));             \
+            }                                                                             \
+        }                                                                                 \
+        for (int p = 0; p < NP; ++p) {                                                     \
+            const int bc  = cds[p];                                                       \
+            const int bit = p * B;                                                        \
+            pd->qs[bit >> 3] |= (uint8_t)(bc << (bit & 7));                               \
+            if (((bit & 7) + B) > 8)  { pd->qs[(bit >> 3) + 1] |= (uint8_t)(bc >> (8 - (bit & 7))); } \
+            if (((bit & 7) + B) > 16) { pd->qs[(bit >> 3) + 2] |= (uint8_t)(bc >> (16 - (bit & 7))); } \
+        }                                                                                 \
+    }                                                                                     \
+}
+
+NEURON_V_CPY(4)
+NEURON_V_CPY(5)
+NEURON_V_CPY(6)
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
