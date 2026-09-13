@@ -760,9 +760,28 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q3_K:    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;  break;
             case GGML_TYPE_Q4_K:    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;  break;
             case GGML_TYPE_Q5_K:    ftype = LLAMA_FTYPE_MOSTLY_Q5_K_M;  break;
-            case GGML_TYPE_NEURON_V4: ftype = LLAMA_FTYPE_MOSTLY_NEURON_V4; break;
-            case GGML_TYPE_NEURON_V6: ftype = LLAMA_FTYPE_MOSTLY_NEURON_V6; break;
-            case GGML_TYPE_NEURON_V5: ftype = LLAMA_FTYPE_MOSTLY_NEURON_V5; break;
+            case GGML_TYPE_NEURON_V4:
+            case GGML_TYPE_NEURON_V5:
+            case GGML_TYPE_NEURON_V6: {
+                // The v* codebooks are compile-time constants, so they are wire format: a
+                // file decoded against a different table than it was encoded with produces
+                // fluent garbage and no error at all. Refitting the tables on true bf16
+                // weights invalidated every earlier v* file exactly this way, and it went
+                // unnoticed because perplexity against the matching binary looked sane.
+                const int kid = gguf_find_key(metadata, "neuron.vq_codebook");
+                const uint64_t want = ggml_neuron_vq_codebook_hash();
+                const uint64_t got  = kid < 0 ? 0 : gguf_get_val_u64(metadata, kid);
+                if (got != want) {
+                    throw std::runtime_error(format(
+                        "%s: this model was quantised against a different neuron v* codebook "
+                        "(file %016llx, build %016llx). The codebook is part of the format; "
+                        "requantise with this build.", __func__,
+                        (unsigned long long) got, (unsigned long long) want));
+                }
+                ftype = type_max == GGML_TYPE_NEURON_V4 ? LLAMA_FTYPE_MOSTLY_NEURON_V4
+                      : type_max == GGML_TYPE_NEURON_V5 ? LLAMA_FTYPE_MOSTLY_NEURON_V5
+                                                    : LLAMA_FTYPE_MOSTLY_NEURON_V6;
+            } break;
             case GGML_TYPE_Q6_K:    ftype = LLAMA_FTYPE_MOSTLY_Q6_K;    break;
             case GGML_TYPE_TQ1_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ1_0;   break;
             case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;

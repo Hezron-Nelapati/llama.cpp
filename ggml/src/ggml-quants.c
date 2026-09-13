@@ -6144,6 +6144,33 @@ NEURON_QUANTIZE(5) NEURON_QUANTIZE(6) NEURON_QUANTIZE(7) NEURON_QUANTIZE(8)
 // pairs and its coverage stops near radius 1.36 while such a pair reaches sqrt(2), so letting
 // the refit shrink d would push pairs outside the domain the codebook was fitted for.
 // ||C[c]||^2 is loop-invariant and shared by every block, so it is built once per type.
+// The codebooks are compile-time constants, which makes them WIRE FORMAT: a file encoded
+// against one table and decoded against another produces fluent garbage with no error, and
+// a perplexity run against the matching binary looks perfectly sane, so nothing catches it.
+// That is not hypothetical -- refitting the tables on true bf16 weights silently invalidated
+// every v* file quantised before the refit. So quantisation stamps this hash into the GGUF
+// and loading refuses a mismatch.
+//
+// FNV-1a over the raw bytes of every table a v* decoder can read. Any refit, any change of
+// K, any change to the sub-block multipliers moves it.
+uint64_t ggml_neuron_vq_codebook_hash(void) {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char * spans[5];
+    size_t                lens [5];
+    spans[0] = (const unsigned char *) kNeuronVQ4;   lens[0] = sizeof(kNeuronVQ4);
+    spans[1] = (const unsigned char *) kNeuronVQ5;   lens[1] = sizeof(kNeuronVQ5);
+    spans[2] = (const unsigned char *) kNeuronVQ6;   lens[2] = sizeof(kNeuronVQ6);
+    spans[3] = (const unsigned char *) kNeuronVQSB;  lens[3] = sizeof(kNeuronVQSB);
+    spans[4] = (const unsigned char *) kNeuronVQSB64;lens[4] = sizeof(kNeuronVQSB64);
+    for (int i = 0; i < 5; ++i) {
+        for (size_t j = 0; j < lens[i]; ++j) {
+            h ^= (uint64_t) spans[i][j];
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
 // Choosing the best codeword at every candidate scale is a convex-hull query, not a scan.
 //
 //     argmax_c  2g<x,C[c]> - g^2||C[c]||^2   ==   argmax_c  dot[c] - (g/2)*cn[c]

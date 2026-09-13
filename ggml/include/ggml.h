@@ -2952,6 +2952,12 @@ extern "C" {
     // some quantization type cannot be used without an importance matrix
     GGML_API bool ggml_quantize_requires_imatrix(enum ggml_type type);
 
+    // Hash of every shipped neuron v* codebook. Those tables are compile-time constants and
+    // therefore part of the wire format: a file decoded against a different table than it was
+    // encoded with yields fluent garbage and no error. Quantisation stamps this into the GGUF
+    // as "neuron.vq_codebook" and the loader refuses a mismatch.
+    GGML_API uint64_t ggml_neuron_vq_codebook_hash(void);
+
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(
             enum ggml_type   type,

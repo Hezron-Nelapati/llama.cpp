@@ -1006,6 +1006,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_GENERAL_QUANTIZATION_VERSION).c_str(), GGML_QNT_VERSION);
     gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_GENERAL_FILE_TYPE).c_str(), ftype);
 
+    // The v* codebooks are compile-time constants and therefore wire format: a file encoded
+    // against one table and decoded against another produces fluent garbage with no error.
+    // Refitting the tables on true bf16 weights silently invalidated every earlier v* file
+    // exactly this way, and a perplexity run against the matching binary looked fine, so
+    // nothing caught it. Stamp the table hash; llama_model_loader refuses a mismatch.
+    switch (default_type) {
+        case GGML_TYPE_NEURON_V4:
+        case GGML_TYPE_NEURON_V5:
+        case GGML_TYPE_NEURON_V6:
+            gguf_set_val_u64(ctx_out.get(), "neuron.vq_codebook",
+                             ggml_neuron_vq_codebook_hash());
+            break;
+        default:
+            break;
+    }
+
     // Remove split metadata
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str());
     gguf_remove_key(ctx_out.get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str());
