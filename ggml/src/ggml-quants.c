@@ -6252,15 +6252,6 @@ static bool  g_vq##SFX##_ready = false;                                         
 /* codebook behaves exactly as before. ggml_neuron_vq_set_codebook rebinds it to a     */ \
 /* table carried in the model file, and clears the cached hull sort derived from it.   */ \
 static const float * g_vq##SFX##_tbl = kNeuronVQ##SFX;                                    \
-/* A uniform grid over the codeword plane, K cells for K codewords. The scale search asks  */ \
-/* argmin |a - g c|^2 over c, which is argmin |a/g - c|^2 -- plain nearest neighbour in    */ \
-/* TWO dimensions. Brute force costs K per query; a grid costs the cells it has to touch,  */ \
-/* typically one or two rings. Exact: the ring walk stops only once the best distance is   */ \
-/* shorter than the distance to anything still unscanned.                                 */ \
-static int   g_vq##SFX##_gs[NEURON_VQ##SFX##_K + 1];                                       \
-static int   g_vq##SFX##_gi[NEURON_VQ##SFX##_K];                                           \
-static float g_vq##SFX##_gx0, g_vq##SFX##_gy0, g_vq##SFX##_gh, g_vq##SFX##_ginv;           \
-static int   g_vq##SFX##_gn;   /* cells per side; K is a perfect square for every v-type */ \
                                                                                            \
 static void neuron_vq##SFX##_init(void) {                                                  \
     if (g_vq##SFX##_ready) {                                                               \
@@ -6283,102 +6274,7 @@ static void neuron_vq##SFX##_init(void) {                                       
         }                                                                                  \
         g_vq##SFX##_ord[b+1] = key;                                                        \
     }                                                                                      \
-    {                                                                                      \
-        const int K = NEURON_VQ##SFX##_K;                                                  \
-        float x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;                \
-        for (int c = 0; c < K; ++c) {                                                      \
-            const float cx = g_vq##SFX##_tbl[2*c], cy = g_vq##SFX##_tbl[2*c + 1];          \
-            if (cx < x0) x0 = cx;  if (cx > x1) x1 = cx;                                   \
-            if (cy < y0) y0 = cy;  if (cy > y1) y1 = cy;                                   \
-        }                                                                                  \
-        int G = 1;                                                                         \
-        while (G*G < K) { ++G; }        /* K is 256/1024/4096: G is exact */               \
-        const float ext = fmaxf(x1 - x0, y1 - y0) * 1.000001f + 1e-9f;                     \
-        g_vq##SFX##_gn   = G;                                                              \
-        g_vq##SFX##_gx0  = x0;                                                             \
-        g_vq##SFX##_gy0  = y0;                                                             \
-        g_vq##SFX##_gh   = ext / (float) G;                                                \
-        g_vq##SFX##_ginv = (float) G / ext;                                                \
-        for (int i = 0; i <= G*G; ++i) { g_vq##SFX##_gs[i] = 0; }                          \
-        for (int c = 0; c < K; ++c) {                                                      \
-            int i = (int) ((g_vq##SFX##_tbl[2*c]     - x0) * g_vq##SFX##_ginv);            \
-            int j = (int) ((g_vq##SFX##_tbl[2*c + 1] - y0) * g_vq##SFX##_ginv);            \
-            if (i < 0) i = 0;  if (i >= G) i = G - 1;                                      \
-            if (j < 0) j = 0;  if (j >= G) j = G - 1;                                      \
-            ++g_vq##SFX##_gs[j*G + i + 1];                                                 \
-        }                                                                                  \
-        for (int i = 0; i < G*G; ++i) { g_vq##SFX##_gs[i+1] += g_vq##SFX##_gs[i]; }        \
-        int fill[NEURON_VQ##SFX##_K];                                                      \
-        for (int i = 0; i < G*G; ++i) { fill[i] = g_vq##SFX##_gs[i]; }                     \
-        for (int c = 0; c < K; ++c) {                                                      \
-            int i = (int) ((g_vq##SFX##_tbl[2*c]     - x0) * g_vq##SFX##_ginv);            \
-            int j = (int) ((g_vq##SFX##_tbl[2*c + 1] - y0) * g_vq##SFX##_ginv);            \
-            if (i < 0) i = 0;  if (i >= G) i = G - 1;                                      \
-            if (j < 0) j = 0;  if (j >= G) j = G - 1;                                      \
-            g_vq##SFX##_gi[fill[j*G + i]++] = c;                                           \
-        }                                                                                  \
-    }                                                                                      \
     g_vq##SFX##_ready = true;  /* idempotent: same values from every thread, no lock */    \
-}                                                                                          \
-                                                                                           \
-/* Exact nearest codeword to (qx,qy), by expanding rings over the grid. Rings stop as soon */ \
-/* as the best distance found is shorter than the distance to the edge of what has been    */ \
-/* scanned, so nothing closer can be hiding outside -- exactness costs one comparison.     */ \
-static inline int neuron_vq##SFX##_nn(float qx, float qy, float * GGML_RESTRICT out_d2) {  \
-    const int   G    = g_vq##SFX##_gn;                                                     \
-    const float h    = g_vq##SFX##_gh;                                                     \
-    const float x0   = g_vq##SFX##_gx0, y0 = g_vq##SFX##_gy0;                              \
-    const int   ci   = (int) floorf((qx - x0) * g_vq##SFX##_ginv);                         \
-    const int   cj   = (int) floorf((qy - y0) * g_vq##SFX##_ginv);                         \
-    int   best = -1;                                                                       \
-    float bd   = INFINITY;                                                                 \
-    for (int r = 0; ; ++r) {                                                               \
-        const int li = ci - r, hi = ci + r, lj = cj - r, hj = cj + r;                      \
-        for (int j = lj; j <= hj; ++j) {                                                   \
-            if (j < 0 || j >= G) { continue; }                                             \
-            const int on_j = (j == lj || j == hj);                                         \
-            for (int i = li; i <= hi; ++i) {                                               \
-                if (i < 0 || i >= G) { continue; }                                         \
-                if (r > 0 && !on_j && i != li && i != hi) { continue; } /* already done */ \
-                const int b = j*G + i;                                                     \
-                for (int t = g_vq##SFX##_gs[b]; t < g_vq##SFX##_gs[b+1]; ++t) {            \
-                    const int   c  = g_vq##SFX##_gi[t];                                    \
-                    const float dx = qx - g_vq##SFX##_tbl[2*c];                            \
-                    const float dy = qy - g_vq##SFX##_tbl[2*c + 1];                        \
-                    const float d  = dx*dx + dy*dy;                                        \
-                    if (d < bd) { bd = d; best = c; }                                      \
-                }                                                                          \
-            }                                                                              \
-        }                                                                                  \
-        if (li < 0 && hi >= G && lj < 0 && hj >= G) { break; }  /* whole grid seen */      \
-        if (best >= 0) {                                                                   \
-            /* shortest distance from q to anything outside the scanned rectangle */       \
-            const float m = fminf(fminf(qx - (x0 + li*h), (x0 + (hi + 1)*h) - qx),         \
-                                  fminf(qy - (y0 + lj*h), (y0 + (hj + 1)*h) - qy));        \
-            if (m > 0.0f && bd <= m*m) { break; }                                          \
-        }                                                                                  \
-    }                                                                                      \
-    *out_d2 = bd;                                                                          \
-    return best;                                                                           \
-}                                                                                          \
-                                                                                           \
-/* The scale search, one nearest-neighbour query per candidate scale. |a - g c|^2 equals   */ \
-/* g^2 |a/g - c|^2, so the grid answers it directly and the hull is no longer needed here. */ \
-static inline void neuron_vq##SFX##_scales(float ax, float ay,                             \
-                                           const float * GGML_RESTRICT gv, int NM,         \
-                                           int * GGML_RESTRICT out_c,                      \
-                                           float * GGML_RESTRICT out_sse) {                \
-    for (int j = 0; j < NM; ++j) {                                                         \
-        const float g = gv[j];                                                             \
-        if (!(g > 0.0f)) {                                                                 \
-            out_c[j] = 0; out_sse[j] = ax*ax + ay*ay; continue;                            \
-        }                                                                                  \
-        const float inv = 1.0f / g;                                                        \
-        float d2 = 0.0f;                                                                   \
-        const int c = neuron_vq##SFX##_nn(ax*inv, ay*inv, &d2);                            \
-        out_c[j]   = c;                                                                    \
-        out_sse[j] = g*g*d2;                                                               \
-    }                                                                                      \
 }                                                                                          \
                                                                                            \
 /* best code for one pair at scale g, and the squared error it leaves behind */            \
@@ -6419,6 +6315,8 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
             y[i].d = GGML_FP32_TO_FP16(0.0f);                                              \
             continue;                                                                      \
         }                                                                                  \
+    int   hidx[NEURON_VQ##SFX##_K];                                                        \
+    float hdot[NEURON_VQ##SFX##_K];                                                        \
     /* hull scratch, on the stack because llama-quantize runs one encoder per thread */    \
         int   cs[QK_NEURON / 2];                                                           \
         int   mi[NEURON_VQ_NSB];                                                           \
@@ -6444,7 +6342,9 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
                     const int p = sblk*PSB + t;                                            \
                     int   pc[64];                                                          \
                     float ps[64];                                                          \
-                    neuron_vq##SFX##_scales(xb[2*p], xb[2*p + 1], gv, NM, pc, ps);         \
+                    neuron_vq_scales(g_vq##SFX##_tbl, g_vq##SFX##_cn, g_vq##SFX##_ord,      \
+                                     NEURON_VQ##SFX##_K, xb[2*p], xb[2*p + 1],             \
+                                     gv, NM, pc, ps, hdot, hidx);                 \
                     for (int j = 0; j < NM; ++j) {                                         \
                         cc[j][t] = pc[j];                                                  \
                         tot[j]  += ps[j];                                                  \
