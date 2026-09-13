@@ -72,6 +72,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NEURON_M8", LLAMA_FTYPE_MOSTLY_NEURON_M8, "8.59 bpw, neuron pair codec", },
     { "NEURON_V4", LLAMA_FTYPE_MOSTLY_NEURON_V4, "4.375 bpw, neuron d=2 VQ codec", },
     { "NEURON_V6", LLAMA_FTYPE_MOSTLY_NEURON_V6, "6.5 bpw, neuron d=2 VQ codec", },
+    { "NEURON_D4", LLAMA_FTYPE_MOSTLY_NEURON_D4, "4.375 bpw, neuron d=4 VQ -- v4's size, 1 MiB codebook, high compute", },
     { "NEURON_V5", LLAMA_FTYPE_MOSTLY_NEURON_V5, "5.125 bpw, neuron d=2 VQ codec", },
     { "Q5_K",     LLAMA_FTYPE_MOSTLY_Q5_K_M,   "alias for Q5_K_M",                  },
     { "Q5_K_S",   LLAMA_FTYPE_MOSTLY_Q5_K_S,   " 5.21G, +0.1049 ppl @ Llama-3-8B",  },
@@ -103,6 +104,7 @@ static bool striequals(const char * a, const char * b) {
 // Which v-type an ftype asks for, or GGML_TYPE_COUNT if it is not a neuron v* ftype.
 static ggml_type neuron_vq_type_of(llama_ftype ftype) {
     switch (ftype) {
+        case LLAMA_FTYPE_MOSTLY_NEURON_D4: return GGML_TYPE_NEURON_D4;
         case LLAMA_FTYPE_MOSTLY_NEURON_V4: return GGML_TYPE_NEURON_V4;
         case LLAMA_FTYPE_MOSTLY_NEURON_V5: return GGML_TYPE_NEURON_V5;
         case LLAMA_FTYPE_MOSTLY_NEURON_V6: return GGML_TYPE_NEURON_V6;
@@ -701,7 +703,9 @@ int llama_quantize(int argc, char ** argv) {
             fprintf(stderr, "%s: --neuron-codebook needs a NEURON_V* ftype\n", __func__);
             return 1;
         }
-        const int K = ggml_neuron_vq_codebook_size(nt);
+        const int K = params.ftype == LLAMA_FTYPE_MOSTLY_NEURON_D4
+                    ? ggml_neuron_d4_codebook_len() / 2      // the check below doubles it
+                    : ggml_neuron_vq_codebook_size(nt);
         std::ifstream f(neuron_codebook_file, std::ios::binary);
         if (!f) {
             fprintf(stderr, "%s: cannot open %s\n", __func__, neuron_codebook_file.c_str());
@@ -714,7 +718,11 @@ int llama_quantize(int argc, char ** argv) {
                     neuron_codebook_file.c_str(), K, neuron_codebook.size() * sizeof(float));
             return 1;
         }
-        ggml_neuron_vq_set_codebook(nt, neuron_codebook.data());
+        if (params.ftype == LLAMA_FTYPE_MOSTLY_NEURON_D4) {
+            ggml_neuron_d4_set_codebook(neuron_codebook.data());
+        } else {
+            ggml_neuron_vq_set_codebook(nt, neuron_codebook.data());
+        }
         fprintf(stderr, "%s: codebook <- %s (%d pairs)\n", __func__, neuron_codebook_file.c_str(), K);
     }
 

@@ -402,6 +402,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
             // neuron_v* are 128-block types; these are the nearest 32-block rates
             case GGML_TYPE_NEURON_V4: return_type = GGML_TYPE_Q4_0; break;
+            case GGML_TYPE_NEURON_D4: return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_NEURON_V5: return_type = GGML_TYPE_Q5_0; break;
             case GGML_TYPE_NEURON_V6: return_type = GGML_TYPE_Q8_0; break;
             default:
@@ -1228,6 +1229,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_NEURON_M8: return GGML_TYPE_NEURON_M8;
         case LLAMA_FTYPE_MOSTLY_NEURON_V4: return GGML_TYPE_NEURON_V4;
         case LLAMA_FTYPE_MOSTLY_NEURON_V6: return GGML_TYPE_NEURON_V6;
+        case LLAMA_FTYPE_MOSTLY_NEURON_D4: return GGML_TYPE_NEURON_D4;
         case LLAMA_FTYPE_MOSTLY_NEURON_V5: return GGML_TYPE_NEURON_V5;
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
@@ -1357,6 +1359,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // exactly this way, and a perplexity run against the matching binary looked fine, so
     // nothing caught it. Stamp the table hash; llama_model_loader refuses a mismatch.
     switch (default_type) {
+        case GGML_TYPE_NEURON_D4: {
+            const float * tbl = ggml_neuron_d4_get_codebook();
+            if (tbl) {
+                gguf_set_arr_data(ctx_out.get(), "neuron.d4.codebook", GGUF_TYPE_FLOAT32,
+                                  tbl, (size_t) ggml_neuron_d4_codebook_len());
+            }
+        } break;
         case GGML_TYPE_NEURON_V4:
         case GGML_TYPE_NEURON_V5:
         case GGML_TYPE_NEURON_V6: {

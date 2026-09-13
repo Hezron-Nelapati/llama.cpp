@@ -450,7 +450,16 @@ extern "C" {
         GGML_TYPE_NEURON_V5 = 51,
         GGML_TYPE_NEURON_V4 = 52,
         GGML_TYPE_NEURON_V6 = 53,
-        GGML_TYPE_COUNT   = 54,
+        // d=4: one 16-bit index per four weights, same 70-byte block as v4 -- the SAME size,
+        // not a smaller one. What differs is the table: 65536 quads, 1 MiB, carried in the
+        // model file and never compiled in.
+        //
+        // For machines with compute to spare. Encoding sweeps 65536 codewords per quad
+        // against v4's 256, and the table is far too large to stage in threadgroup memory,
+        // so decode gives up the constant-address lookup that v4 enjoys. It buys quality at
+        // a fixed size, and pays for it at both ends.
+        GGML_TYPE_NEURON_D4 = 54,
+        GGML_TYPE_COUNT   = 55,
     };
 
     // [TAG_GGML_PREC]
@@ -2967,6 +2976,12 @@ extern "C" {
     GGML_API int           ggml_neuron_vq_codebook_size(enum ggml_type type);  // K, in pairs
     // a model's table is bound for this type; GGML_TYPE_COUNT asks "for any v-type"
     GGML_API bool          ggml_neuron_vq_codebook_is_custom(enum ggml_type type);
+
+    // d=4 carries no compiled-in table: 65536 quads is 1 MiB. Bind one from the model file
+    // (or from --neuron-codebook) before encoding or decoding this type.
+    GGML_API void          ggml_neuron_d4_set_codebook(const float * tbl);
+    GGML_API const float * ggml_neuron_d4_get_codebook(void);
+    GGML_API int           ggml_neuron_d4_codebook_len(void);  // K * dim, in floats
 
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(

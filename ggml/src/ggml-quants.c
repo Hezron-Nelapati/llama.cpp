@@ -5650,6 +5650,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         NEURON_V_VALIDATE(4)
         NEURON_V_VALIDATE(5)
         NEURON_V_VALIDATE(6)
+        case GGML_TYPE_NEURON_D4:
+            {
+                const block_neuron_d4 * q = (const block_neuron_d4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!isfinite(GGML_FP16_TO_FP32(q[i].d))) {
+                        return false;
+                    }
+                }
+            } break;
         case GGML_TYPE_NEURON_M5:
             {
                 // only the anchors can be invalid: every code is a bit pattern and every
@@ -6243,6 +6252,198 @@ static void neuron_vq_scales(const float * GGML_RESTRICT cb, const float * GGML_
 }
 
 #define NEURON_VQ_REFIT 2
+
+
+// ---------------------------------------------------------------------------------------
+// d=4 variant. One 16-bit index per four weights, against a 65536-quad codebook that lives
+// in the model file rather than in this binary -- at 1 MiB it has no business being a
+// compile-time constant, and beta4 already carries codebooks in the GGUF.
+//
+// Same 70-byte block as v4, same scale structure, same hull scale search. The hull does not
+// care about dimension: argmax_c 2g<a,c> - g^2|c|^2 is a linear functional of (dot_c, cn_c)
+// whatever d is, so the maximiser is still an upper-left hull vertex and a sorted family of
+// scales still walks it monotonically. Only the inner product widens from 2 terms to 4.
+// ---------------------------------------------------------------------------------------
+
+static const float * g_d4_tbl   = NULL;                  // bound from the model file
+static float       * g_d4_cn    = NULL;                  // |c|^2 per codeword
+static int         * g_d4_ord   = NULL;                  // codewords by cn ascending
+static float       * g_d4_own   = NULL;                  // our copy of the table
+static bool          g_d4_ready = false;
+
+void ggml_neuron_d4_set_codebook(const float * tbl) {
+    if (!tbl) {
+        free(g_d4_own); g_d4_own = NULL;
+        g_d4_tbl = NULL; g_d4_ready = false;
+        return;
+    }
+    const size_t n = (size_t) NEURON_D4_K * NEURON_D4_DIM;
+    if (!g_d4_own) {
+        g_d4_own = (float *) malloc(n * sizeof(float));
+        g_d4_cn  = (float *) malloc((size_t) NEURON_D4_K * sizeof(float));
+        g_d4_ord = (int   *) malloc((size_t) NEURON_D4_K * sizeof(int));
+    }
+    memcpy(g_d4_own, tbl, n * sizeof(float));
+    g_d4_tbl = g_d4_own;
+
+    for (int c = 0; c < NEURON_D4_K; ++c) {
+        const float * p = g_d4_tbl + (size_t) c * NEURON_D4_DIM;
+        g_d4_cn[c] = p[0]*p[0] + p[1]*p[1] + p[2]*p[2] + p[3]*p[3];
+        g_d4_ord[c] = c;
+    }
+    // sort by cn ascending; K is 65536 so an O(n^2) insertion sort is out of the question
+    for (int gap = NEURON_D4_K/2; gap > 0; gap /= 2) {      // shell sort: no allocation
+        for (int i = gap; i < NEURON_D4_K; ++i) {
+            const int key = g_d4_ord[i];
+            const float kv = g_d4_cn[key];
+            int j = i;
+            while (j >= gap && g_d4_cn[g_d4_ord[j-gap]] > kv) { g_d4_ord[j] = g_d4_ord[j-gap]; j -= gap; }
+            g_d4_ord[j] = key;
+        }
+    }
+    g_d4_ready = true;
+}
+
+const float * ggml_neuron_d4_get_codebook(void) { return g_d4_tbl; }
+
+int ggml_neuron_d4_codebook_len(void) { return NEURON_D4_K * NEURON_D4_DIM; }
+
+void quantize_row_neuron_d4_ref(const float * GGML_RESTRICT x,
+                                block_neuron_d4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NEURON == 0);
+    GGML_ASSERT(g_d4_ready && "neuron_d4 needs a codebook: pass --neuron-codebook or load a model that carries one");
+
+    const int QSB  = NEURON_VQ_SBV / NEURON_D4_DIM;             // quads per sub-block: 4
+    const int NM   = 1 << NEURON_D4_SBB;                        // candidate multipliers: 16
+    const int64_t nb = k / QK_NEURON;
+
+    float * dot  = (float *) malloc((size_t) NEURON_D4_K * sizeof(float));
+    int   * hull = (int   *) malloc((size_t) NEURON_D4_K * sizeof(int));
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float * xb = x + i*QK_NEURON;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NEURON; ++j) {
+            const float a = fabsf(xb[j]);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0.0f) {
+            memset(&y[i], 0, sizeof(block_neuron_d4));
+            continue;
+        }
+        y[i].d = GGML_FP32_TO_FP16(amax);
+        const float d = GGML_FP16_TO_FP32(y[i].d);
+
+        memset(y[i].sb, 0, sizeof(y[i].sb));
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {
+            float gv[16];
+            for (int j = 0; j < NM; ++j) gv[j] = d * kNeuronVQSB[j];
+
+            float tot[16];
+            int   cc [16][NEURON_VQ_SBV / NEURON_D4_DIM];
+            for (int j = 0; j < NM; ++j) tot[j] = 0.0f;
+
+            for (int t = 0; t < QSB; ++t) {
+                const int q = sblk*QSB + t;
+                const float ax = xb[4*q], ay = xb[4*q+1], az = xb[4*q+2], aw = xb[4*q+3];
+                const float an = ax*ax + ay*ay + az*az + aw*aw;
+
+                for (int c = 0; c < NEURON_D4_K; ++c) {
+                    const float * p = g_d4_tbl + (size_t) c * NEURON_D4_DIM;
+                    dot[c] = ax*p[0] + ay*p[1] + az*p[2] + aw*p[3];
+                }
+                // upper-left hull over cn ascending, exactly as the d=2 path does
+                int nh = 0; float ymax = -INFINITY;
+                for (int u = 0; u < NEURON_D4_K; ++u) {
+                    const int c = g_d4_ord[u];
+                    if (dot[c] <= ymax) continue;
+                    ymax = dot[c];
+                    while (nh >= 2) {
+                        const int a1 = hull[nh-2], b1 = hull[nh-1];
+                        const float dx1 = g_d4_cn[b1] - g_d4_cn[a1], dy1 = dot[b1] - dot[a1];
+                        const float dx2 = g_d4_cn[c]  - g_d4_cn[b1], dy2 = dot[c]  - dot[b1];
+                        if (dy2*dx1 < dy1*dx2) break;
+                        --nh;
+                    }
+                    hull[nh++] = c;
+                }
+                // scales descend, so the maximiser walks the hull forward once
+                int h = 0;
+                for (int j = 0; j < NM; ++j) {
+                    const float g = gv[j], sl = 0.5f * g;
+                    while (h + 1 < nh) {
+                        const int a1 = hull[h], b1 = hull[h+1];
+                        const float num = dot[b1] - dot[a1];
+                        const float den = g_d4_cn[b1] - g_d4_cn[a1];
+                        if (den > 0.0f && num > sl*den) ++h; else break;
+                    }
+                    const int c = hull[h];
+                    cc[j][t] = c;
+                    tot[j]  += an - (2.0f*g*dot[c] - g*g*g_d4_cn[c]);
+                }
+            }
+
+            int   mj = 0; float mb = INFINITY;
+            for (int j = 0; j < NM; ++j) if (tot[j] < mb) { mb = tot[j]; mj = j; }
+
+            const int sbit = sblk * NEURON_D4_SBB;
+            y[i].sb[sbit >> 3] |= (uint8_t)(mj << (sbit & 7));
+
+            for (int t = 0; t < QSB; ++t) {
+                const int q   = sblk*QSB + t;
+                const int bc  = cc[mj][t];
+                const int bit = q * NEURON_D4_BITS;              // 16 bits: byte aligned
+                y[i].qs[bit >> 3]       = (uint8_t)(bc & 0xFF);
+                y[i].qs[(bit >> 3) + 1] = (uint8_t)(bc >> 8);
+            }
+        }
+    }
+    free(dot); free(hull);
+}
+
+void dequantize_row_neuron_d4(const block_neuron_d4 * GGML_RESTRICT x,
+                              float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_NEURON == 0);
+    GGML_ASSERT(g_d4_ready && "neuron_d4 needs a codebook");
+    const int QSB = NEURON_VQ_SBV / NEURON_D4_DIM;
+    const int64_t nb = k / QK_NEURON;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        float * yb = y + i*QK_NEURON;
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {
+            const int sbit = sblk * NEURON_D4_SBB;
+            const int mj   = (x[i].sb[sbit >> 3] >> (sbit & 7)) & (NEURON_D4_K > 0 ? 0xF : 0xF);
+            const float g  = d * kNeuronVQSB[mj];
+            for (int t = 0; t < QSB; ++t) {
+                const int q   = sblk*QSB + t;
+                const int bit = q * NEURON_D4_BITS;
+                const int c   = x[i].qs[bit >> 3] | (x[i].qs[(bit >> 3) + 1] << 8);
+                const float * p = g_d4_tbl + (size_t) c * NEURON_D4_DIM;
+                yb[4*q]   = g * p[0];
+                yb[4*q+1] = g * p[1];
+                yb[4*q+2] = g * p[2];
+                yb[4*q+3] = g * p[3];
+            }
+        }
+    }
+}
+
+size_t quantize_neuron_d4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrow, int64_t n_per_row, const float * imatrix) {
+    (void) imatrix;
+    const size_t row_size = ggml_row_size(GGML_TYPE_NEURON_D4, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t r = 0; r < nrow; ++r) {
+        quantize_row_neuron_d4_ref(src, (block_neuron_d4 *) qrow, n_per_row);
+        src  += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
 
 #define NEURON_V_IMPL(SFX)                                                                 \
 static float g_vq##SFX##_cn[NEURON_VQ##SFX##_K];                                           \

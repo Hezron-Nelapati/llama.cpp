@@ -366,6 +366,28 @@ NEURON_BLOCK(8)
 // header is also compiled as Metal, where a pointer parameter needs an address-space
 // qualifier and a generic one will not compile.
 
+// d=4: one index covers four values instead of two. The block is byte-identical to v4 --
+// 32 quads x 16 bits = 64 bytes of codes, same scale fields, same 70 bytes for 128 values --
+// so this is v4's exact size with a wider equation reading a larger table.
+//
+// The table is NOT compiled in. At K=65536 it is 1 MiB, which would bloat this header and,
+// more to the point, the Metal source it is substituted into. It is carried in the model
+// file instead, via the beta4 neuron.vq.codebook machinery.
+#define NEURON_D4_DIM   4
+#define NEURON_D4_BITS  16                              /* bits per quad               */
+#define NEURON_D4_K     65536
+#define NEURON_D4_SBB   4                               /* sub-block index width       */
+
+typedef struct {
+    ggml_half d;
+    uint8_t   sb[NEURON_VQ_SBBY(NEURON_D4_SBB)];
+    uint8_t   qs[(QK_NEURON / NEURON_D4_DIM) * NEURON_D4_BITS / 8];
+} block_neuron_d4;
+static_assert(sizeof(block_neuron_d4) == sizeof(ggml_half) +
+              NEURON_VQ_SBBY(NEURON_D4_SBB) +
+              (QK_NEURON / NEURON_D4_DIM) * NEURON_D4_BITS / 8,
+              "wrong block_neuron_d4 size/padding");
+
 NEURON_V_BLOCK(4)
 NEURON_V_BLOCK(5)
 NEURON_V_BLOCK(6)

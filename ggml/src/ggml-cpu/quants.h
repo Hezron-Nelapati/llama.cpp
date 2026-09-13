@@ -128,6 +128,12 @@ NEURON_V_VD_DECL(4)
 NEURON_V_VD_DECL(5)
 NEURON_V_VD_DECL(6)
 
+void ggml_vec_dot_neuron_d4_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                const void * GGML_RESTRICT vx, size_t bx,
+                                const void * GGML_RESTRICT vy, size_t by,
+                                int nrc);
+void quantize_row_neuron_d4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
 #ifdef __cplusplus
 }
 #endif

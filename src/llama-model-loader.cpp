@@ -760,6 +760,21 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q3_K:    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;  break;
             case GGML_TYPE_Q4_K:    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;  break;
             case GGML_TYPE_Q5_K:    ftype = LLAMA_FTYPE_MOSTLY_Q5_K_M;  break;
+            case GGML_TYPE_NEURON_D4: {
+                // d=4 has no compiled-in table; the file must carry one.
+                const int cb = gguf_find_key(metadata, "neuron.d4.codebook");
+                if (cb < 0) {
+                    throw std::runtime_error(format("%s: neuron_d4 model carries no codebook", __func__));
+                }
+                const size_t n = gguf_get_arr_n(metadata, cb);
+                if (gguf_get_arr_type(metadata, cb) != GGUF_TYPE_FLOAT32 ||
+                    n != (size_t) ggml_neuron_d4_codebook_len()) {
+                    throw std::runtime_error(format("%s: neuron.d4.codebook is %zu values, expected %d",
+                                                    __func__, n, ggml_neuron_d4_codebook_len()));
+                }
+                ggml_neuron_d4_set_codebook((const float *) gguf_get_arr_data(metadata, cb));
+                ftype = LLAMA_FTYPE_MOSTLY_NEURON_D4;
+            } break;
             case GGML_TYPE_NEURON_V4:
             case GGML_TYPE_NEURON_V5:
             case GGML_TYPE_NEURON_V6: {

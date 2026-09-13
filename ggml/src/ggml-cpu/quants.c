@@ -1480,6 +1480,47 @@ NEURON_FROM_FLOAT(5) NEURON_FROM_FLOAT(6) NEURON_FROM_FLOAT(7) NEURON_FROM_FLOAT
 // neuron_v* dot product. Unlike the polar family there is no magnitude table to build per
 // block and no angle table to stride: a code indexes the codebook directly, so the whole
 // per-block preamble is one fp16 read.
+// d=4 dot product. Decode is a gather of four values per index, so this is the v-family's
+// shape with the inner step widened -- no scale search, no hull, just reconstruct and
+// accumulate.
+void quantize_row_neuron_d4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_neuron_d4_ref(x, (block_neuron_d4 *) y, k);
+}
+
+void ggml_vec_dot_neuron_d4_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                const void * GGML_RESTRICT vx, size_t bx,
+                                const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    (void) bs; (void) bx; (void) by; (void) nrc;
+    const block_neuron_d4 * GGML_RESTRICT x = (const block_neuron_d4 *) vx;
+    const float * GGML_RESTRICT y = (const float *) vy;
+    const int nb  = n / QK_NEURON;
+    const int QSB = NEURON_VQ_SBV / NEURON_D4_DIM;
+    const float * tbl = ggml_neuron_d4_get_codebook();
+    GGML_ASSERT(tbl && "neuron_d4 needs a codebook");
+
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float * yb = y + i*QK_NEURON;
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {
+            const int sbit = sblk * NEURON_D4_SBB;
+            const int mj   = (x[i].sb[sbit >> 3] >> (sbit & 7)) & 0xF;
+            const float g  = d * kNeuronVQSB[mj];
+            float acc = 0.0f;
+            for (int t = 0; t < QSB; ++t) {
+                const int q   = sblk*QSB + t;
+                const int bit = q * NEURON_D4_BITS;
+                const int c   = x[i].qs[bit >> 3] | (x[i].qs[(bit >> 3) + 1] << 8);
+                const float * p = tbl + (size_t) c * NEURON_D4_DIM;
+                acc += yb[4*q]*p[0] + yb[4*q+1]*p[1] + yb[4*q+2]*p[2] + yb[4*q+3]*p[3];
+            }
+            sum += g * acc;
+        }
+    }
+    *s = sum;
+}
+
 #define NEURON_V_VEC_DOT(SFX)                                                                \
 void ggml_vec_dot_neuron_v##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,             \
                                       const void * GGML_RESTRICT vx, size_t bx,              \
