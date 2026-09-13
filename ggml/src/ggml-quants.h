@@ -142,6 +142,7 @@ NEURON_DECL(5) NEURON_DECL(6) NEURON_DECL(7) NEURON_DECL(8)
                                            int64_t n_per_row, const float * quant_weights);
 NEURON_V_DECL(4)
 NEURON_V_DECL(5)
+NEURON_V_DECL(6)
 
 #ifdef __cplusplus
 }

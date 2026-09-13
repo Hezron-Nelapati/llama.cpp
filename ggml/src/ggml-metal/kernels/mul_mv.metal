@@ -3582,9 +3582,13 @@ void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                    
     threadgroup half2 * svq = (threadgroup half2 *) shmem;                                  \
     /* the sub-block multiplier index comes from per-row data, so that constant-space read is\
        divergent -- the -45% tier. 16 floats in threadgroup memory instead. */              \
-    threadgroup float * ssb = (threadgroup float *) (shmem + K*4);                          \
-    for (int v = 32*sgitg + tiisg; v < 16; v += 32*NSG) {                                   \
-        ssb[v] = kNeuronVQSB[v];                                                            \
+    /* svq occupies K half2 ahead of it only when this type stages; at STAGE=0 the          \
+       allocation is the 64 bytes for these multipliers alone, so ssb starts at 0. */       \
+    threadgroup float * ssb = (threadgroup float *) (shmem + (STAGE ? K*4 : 0));            \
+    /* 16 multipliers at v4/v5, 64 at v6: the index width is per type */                    \
+    const int NSBT = 1 << NEURON_VQ##SFX##_SBB;                                             \
+    for (int v = 32*sgitg + tiisg; v < NSBT; v += 32*NSG) {                                 \
+        ssb[v] = NEURON_VQ##SFX##_SBT[v];                                                   \
     }                                                                                       \
     if (STAGE) {                                                                            \
         for (int v = 32*sgitg + tiisg; v < K; v += 32*NSG) {                                \
@@ -3636,8 +3640,13 @@ void kernel_mul_mv_neuron_v##SFX##_f32_impl(                                    
         FOR_UNROLL (short row = 0; row < N_R0_NEURON_V##SFX; ++row) {                       \
             device const block_neuron_v##SFX * xr = (device const block_neuron_v##SFX *)    \
                 ((device const char *) x + row*args.nb01);                                  \
+            const int bs_ = u * NEURON_VQ##SFX##_SBB;                                       \
+            uint      sv  = (uint) xr[ib].sb[bs_ >> 3];                                     \
+            if (((bs_ & 7) + NEURON_VQ##SFX##_SBB) > 8) {                                   \
+                sv |= (uint) xr[ib].sb[(bs_ >> 3) + 1] << 8;                                \
+            }                                                                               \
             const float d = (float) xr[ib].d                                                \
-                          * ssb[(xr[ib].sb[u >> 1] >> ((u & 1) * 4)) & 0xF];                \
+                          * ssb[(sv >> (bs_ & 7)) & (NSBT - 1)];                            \
             device const ushort * qw = (device const ushort *) (xr[ib].qs + u * B);         \
             ushort w[6] = {0, 0, 0, 0, 0, 0};                                               \
             FOR_UNROLL (short q = 0; q < 6; ++q) { if (q < UW) { w[q] = qw[q]; } }          \
@@ -3675,7 +3684,11 @@ kernel void kernel_mul_mv_neuron_v##SFX##_f32(                                  
     kernel_mul_mv_neuron_v##SFX##_f32_impl(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);\
 }
 
-/* v4's 256-entry table amortises 1:4 against the work and measured a clean win.
-   v5's 1024 entries amortise 1:1, so it reads from constant space instead. */
+/* All three stage. Reading the codebook from constant space instead was measured for v5 and
+   cost ~18% generation -- divergent constant reads serialise, which is the -45% tier the
+   polar work priced. v6 was shipped unstaged on that reasoning and measured no faster either
+   way (85.2 vs 84.8 t/s), so its cost is the 16 KB working set thrashing cache wherever the
+   table lives, not where it is read from. The STAGE flag keeps that A/B one character away. */
 NEURON_V_MV_IMPL(4, 1)
 NEURON_V_MV_IMPL(5, 1)
+NEURON_V_MV_IMPL(6, 1)

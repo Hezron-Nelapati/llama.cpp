@@ -333,6 +333,7 @@ template [[host_name("kernel_get_rows_neuron_m3")]] kernel get_rows_q_t kernel_g
 template [[host_name("kernel_get_rows_neuron_m4")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m4, QK_NEURON/16, dequantize_neuron_m4>;
 template [[host_name("kernel_get_rows_neuron_m5")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m5, QK_NEURON/16, dequantize_neuron_m5>;
 template [[host_name("kernel_get_rows_neuron_v4")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v4, QK_NEURON/16, dequantize_neuron_v4>;
+template [[host_name("kernel_get_rows_neuron_v6")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v6, QK_NEURON/16, dequantize_neuron_v6>;
 template [[host_name("kernel_get_rows_neuron_v5")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v5, QK_NEURON/16, dequantize_neuron_v5>;
 template [[host_name("kernel_get_rows_neuron_m6")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m6, QK_NEURON/16, dequantize_neuron_m6>;
 template [[host_name("kernel_get_rows_neuron_m7")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m7, QK_NEURON/16, dequantize_neuron_m7>;

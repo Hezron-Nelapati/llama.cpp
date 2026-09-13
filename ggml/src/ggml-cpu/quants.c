@@ -1498,7 +1498,13 @@ void ggml_vec_dot_neuron_v##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,
         const float * yb = y + (size_t)i * QK_NEURON;                                        \
         /* one multiplier per sub-block, hoisted out of the pair loop */                     \
         for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                   \
-            const float g = d * kNeuronVQSB[(sb[sblk >> 1] >> ((sblk & 1) * 4)) & 0xF];      \
+            const int bs_ = sblk * NEURON_VQ##SFX##_SBB;                                   \
+            uint32_t  sv  = (uint32_t) sb[bs_ >> 3];                                       \
+            if (((bs_ & 7) + NEURON_VQ##SFX##_SBB) > 8) {                                  \
+                sv |= (uint32_t) sb[(bs_ >> 3) + 1] << 8;                                  \
+            }                                                                              \
+            const float g = d * NEURON_VQ##SFX##_SBT[(sv >> (bs_ & 7))                     \
+                                 & ((1u << NEURON_VQ##SFX##_SBB) - 1u)];                   \
             float acc = 0.0f;                                                                \
             for (int t = 0; t < PSB; ++t) {                                                  \
                 const int p = sblk*PSB + t;                                                  \
@@ -1523,3 +1529,4 @@ void quantize_row_neuron_v##SFX(const float * GGML_RESTRICT x, void * GGML_RESTR
 
 NEURON_V_VEC_DOT(4)
 NEURON_V_VEC_DOT(5)
+NEURON_V_VEC_DOT(6)

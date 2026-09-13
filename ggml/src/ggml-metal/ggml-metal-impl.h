@@ -86,9 +86,14 @@
 // to spread it over, so both now code 8.
 #define N_R0_NEURON_V4  8
 #define N_R0_NEURON_V5  8
+#define N_R0_NEURON_V6  8
 #define N_SG_NEURON_V   2
 #define NEURON_V4_SMEM  (1024 + 64)             /*  256 half2 + 16 sub-block multipliers */
 #define NEURON_V5_SMEM  (4096 + 64)             /* 1024 half2 + 16 sub-block multipliers */
+// v6 stages after all. Reading its 4096 entries from constant space measured ~86 t/s
+// against v5's ~132 -- the divergent constant-read cost the polar work priced at -45%.
+// 16 KB is heavy for residency, but evidently cheaper than not staging.
+#define NEURON_V6_SMEM  (16384 + 64)            /* 4096 half2 + 16 sub-block multipliers */
 
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2

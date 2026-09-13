@@ -1076,8 +1076,14 @@ void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,   
     const int B = NEURON_VQ##SFX##_BITS;                                                  \
     /* il is a 16-value slice and a sub-block is 16 values, so il IS the sub-block index and\
        one multiplier serves the whole call */                                            \
+    const int  bs_ = il * NEURON_VQ##SFX##_SBB;                                           \
+    uint       sv  = (uint) xb->sb[bs_ >> 3];                                             \
+    if (((bs_ & 7) + NEURON_VQ##SFX##_SBB) > 8) {                                         \
+        sv |= (uint) xb->sb[(bs_ >> 3) + 1] << 8;                                         \
+    }                                                                                     \
     const float d = (float) xb->d                                                         \
-                  * kNeuronVQSB[(xb->sb[il >> 1] >> ((il & 1) * 4)) & 0xF];               \
+                  * NEURON_VQ##SFX##_SBT[(sv >> (bs_ & 7))                                \
+                                         & ((1u << NEURON_VQ##SFX##_SBB) - 1u)];          \
     /* One call covers 8 pairs = 8*B bits = B bytes, so B/2 ushort loads replace up to 16 \
        byte loads. Same alignment argument as the GEMV: qs sits at offset 6, the slice offset\
        is il*B, and both block strides are even, so every address is 2-aligned; and B/2 words\
@@ -1104,3 +1110,4 @@ void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,   
 
 NEURON_V_DEQ(4)
 NEURON_V_DEQ(5)
+NEURON_V_DEQ(6)

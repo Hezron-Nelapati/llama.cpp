@@ -126,6 +126,7 @@ NEURON_VD_DECL(5) NEURON_VD_DECL(6) NEURON_VD_DECL(7) NEURON_VD_DECL(8)
                                     int64_t k);
 NEURON_V_VD_DECL(4)
 NEURON_V_VD_DECL(5)
+NEURON_V_VD_DECL(6)
 
 #ifdef __cplusplus
 }

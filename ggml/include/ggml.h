@@ -449,7 +449,8 @@ extern "C" {
         // fp16 scale per block. The suffix is bits/value rounded down: v5 is 5.125.
         GGML_TYPE_NEURON_V5 = 51,
         GGML_TYPE_NEURON_V4 = 52,
-        GGML_TYPE_COUNT   = 53,
+        GGML_TYPE_NEURON_V6 = 53,
+        GGML_TYPE_COUNT   = 54,
     };
 
     // [TAG_GGML_PREC]

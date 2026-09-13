@@ -977,6 +977,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 nr0 = N_R0_NEURON_V5;
                 smem = NEURON_V5_SMEM;
             } break;
+        case GGML_TYPE_NEURON_V6:
+            {
+                nsg = N_SG_NEURON_V;
+                nr0 = N_R0_NEURON_V6;
+                smem = NEURON_V6_SMEM;
+            } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
@@ -1317,6 +1323,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_NEURON_V;
                 nr0 = N_R0_NEURON_V5;
                 smem = NEURON_V5_SMEM;
+            } break;
+        case GGML_TYPE_NEURON_V6:
+            {
+                nsg = N_SG_NEURON_V;
+                nr0 = N_R0_NEURON_V6;
+                smem = NEURON_V6_SMEM;
             } break;
         case GGML_TYPE_Q5_K:
             {
