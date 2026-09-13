@@ -100,6 +100,12 @@ template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_cpy_f32_tq2_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<QK_K,   block_tq2_0,  quantize_tq2_0>;
+// Weight encoding on the GPU. These use the _ss variant, which searches the sub-block
+// multiplier rather than taking the nearest one -- the KV cache path keeps the cheap
+// encoder, because it pays per token and these pay once.
+template [[host_name("kernel_cpy_f32_neuron_v4")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v4, quantize_neuron_v4_ss>;
+template [[host_name("kernel_cpy_f32_neuron_v5")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v5, quantize_neuron_v5_ss>;
+template [[host_name("kernel_cpy_f32_neuron_v6")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NEURON, block_neuron_v6, quantize_neuron_v6_ss>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(

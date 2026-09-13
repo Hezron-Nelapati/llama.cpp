@@ -1969,6 +1969,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_IQ4_NL:
                            case GGML_TYPE_TQ2_0:
                            case GGML_TYPE_I32:
+                           // weight encoding on the GPU, via kernel_cpy_f32_neuron_v*
+                           case GGML_TYPE_NEURON_V4:
+                           case GGML_TYPE_NEURON_V5:
+                           case GGML_TYPE_NEURON_V6:
                                 return true;
                            default:
                                 return false;
