@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <random>
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
@@ -748,6 +749,214 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
+// Fit a d=2 codebook on this model's own weights, mirroring experiments/fit_vq.py so a table
+// from either route is comparable against the other. Scope is the whole model: one table,
+// every tensor. Fitting per tensor buys 0.009 bits, which is not worth a side channel.
+//
+// The fit is non-convex and the seed matters more than it looks -- the alpha sweep moved
+// perplexity 4.5% between adjacent points at essentially equal mse, purely on which basin
+// k-means fell into. One fit is not a measurement.
+static std::vector<float> llama_neuron_fit_codebook(
+        llama_model_loader & ml, ggml_type type, float alpha, uint32_t seed) {
+    const int    K     = ggml_neuron_vq_codebook_size(type);
+    const int    BLK   = 128;
+    const size_t NSAMP = 400000;    // pairs, before the sign orbit doubles them
+    const int    ITERS = 60;
+
+    if (K <= 0) {
+        return {};
+    }
+
+    std::mt19937 rng(seed);
+    std::vector<float> P;
+    P.reserve(NSAMP * 2);
+
+    // the cloud is drawn from the 2D layer weights, norms excluded
+    std::vector<const llama_model_loader::llama_tensor_weight *> src;
+    for (const auto & it : ml.weights_map) {
+        const std::string & name = it.first;
+        const ggml_tensor * t    = it.second.tensor;
+        if (ggml_n_dims(t) != 2)                      continue;
+        if (name.find("weight") == std::string::npos) continue;
+        if (name.find("norm")   != std::string::npos) continue;
+        if (name.find("blk.")   == std::string::npos) continue;
+        src.push_back(&it.second);
+    }
+    if (src.empty()) {
+        LLAMA_LOG_WARN("%s: no layer weights to fit on; keeping the shipped codebook\n", __func__);
+        return {};
+    }
+
+    const size_t per = std::max<size_t>(1, NSAMP / src.size());
+    std::vector<no_init<uint8_t>> buf;
+    std::vector<float> f32;
+
+    for (const auto * w : src) {
+        const ggml_tensor * t = w->tensor;
+        const size_t nelem = ggml_nelements(t);
+        const size_t nblk  = nelem / BLK;
+        if (nblk == 0) {
+            continue;
+        }
+        const size_t want = std::max<size_t>(1, std::min(nblk, per / (BLK / 2) + 1));
+
+        const size_t sz = ggml_nbytes(t);
+        buf.resize(sz);
+        const void * raw = ml.load_data_range(*w, 0, sz, buf.data());
+
+        f32.resize(nelem);
+        if (t->type == GGML_TYPE_F32) {
+            memcpy(f32.data(), raw, nelem * sizeof(float));
+        } else {
+            const auto * tt = ggml_get_type_traits(t->type);
+            if (!tt->to_float) {
+                continue;
+            }
+            tt->to_float(raw, f32.data(), (int64_t) nelem);
+        }
+
+        // Normalise each block by its own absmax before sampling. What the codebook models is
+        // the SHAPE of the pair cloud on a unit disc; magnitude is the block and sub-block
+        // scales' job at runtime. Round the scale through f16 first, because that is the
+        // precision the block will actually carry.
+        for (size_t s = 0; s < want; ++s) {
+            const size_t b  = std::uniform_int_distribution<size_t>(0, nblk - 1)(rng);
+            const float * g = f32.data() + b * BLK;
+            float amax = 0.0f;
+            for (int j = 0; j < BLK; ++j) {
+                amax = std::max(amax, std::fabs(g[j]));
+            }
+            if (amax <= 0.0f) {
+                continue;
+            }
+            amax = ggml_fp16_to_fp32(ggml_fp32_to_fp16(amax));
+            for (int j = 0; j < BLK; j += 2) {
+                P.push_back(g[j]     / amax);
+                P.push_back(g[j + 1] / amax);
+            }
+        }
+        if (P.size() >= NSAMP * 2) {
+            break;
+        }
+    }
+
+    size_t n = P.size() / 2;
+    if (n < (size_t) K) {
+        LLAMA_LOG_WARN("%s: only %zu pairs for K=%d; keeping the shipped codebook\n", __func__, n, K);
+        return {};
+    }
+    // sign orbit: the cloud is symmetric through the origin, and saying so doubles the sample
+    P.reserve(P.size() * 2);
+    for (size_t i = 0, e = P.size(); i < e; ++i) {
+        P.push_back(-P[i]);
+    }
+    n = P.size() / 2;
+
+    // D^2 seeding -- a uniform draw leaves whole regions of the pair plane uncovered
+    std::vector<float> C((size_t) K * 2);
+    std::vector<float> d2(n);
+    {
+        const size_t f = std::uniform_int_distribution<size_t>(0, n - 1)(rng);
+        C[0] = P[2*f]; C[1] = P[2*f + 1];
+        for (size_t i = 0; i < n; ++i) {
+            const float dx = P[2*i] - C[0], dy = P[2*i + 1] - C[1];
+            d2[i] = dx*dx + dy*dy;
+        }
+        for (int c = 1; c < K; ++c) {
+            double tot = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                tot += std::max(d2[i], 1e-12f);
+            }
+            double r = std::uniform_real_distribution<double>(0.0, tot)(rng);
+            size_t pick = n - 1;
+            for (size_t i = 0; i < n; ++i) {
+                r -= std::max(d2[i], 1e-12f);
+                if (r <= 0.0) { pick = i; break; }
+            }
+            C[2*c] = P[2*pick]; C[2*c + 1] = P[2*pick + 1];
+            for (size_t i = 0; i < n; ++i) {
+                const float dx = P[2*i] - C[2*c], dy = P[2*i + 1] - C[2*c + 1];
+                d2[i] = std::min(d2[i], dx*dx + dy*dy);
+            }
+        }
+    }
+
+    // |p|^-alpha, floored at the resolution the quantiser actually has: a disc of K cells over
+    // this cloud has cell radius ~ mean|p|/sqrt(K), and relative error below that is not
+    // something the codebook can represent, so weighting by it only chases noise.
+    std::vector<float> r(n), w(n);
+    double rmean = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        r[i] = std::sqrt(P[2*i]*P[2*i] + P[2*i + 1]*P[2*i + 1]);
+        rmean += r[i];
+    }
+    rmean /= (double) n;
+    const float rfloor = (float) (rmean / std::sqrt((double) K));
+    double wmean = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        w[i] = alpha != 0.0f ? std::pow(std::max(r[i], rfloor), -alpha) : 1.0f;
+        wmean += w[i];
+    }
+    wmean /= (double) n;
+    for (size_t i = 0; i < n; ++i) {
+        w[i] /= (float) wmean;
+    }
+
+    std::vector<int>    lab(n);
+    std::vector<double> cnt(K), tot(2 * (size_t) K);
+    double mse = 0.0;
+    for (int it = 0; it < ITERS; ++it) {
+        std::fill(cnt.begin(), cnt.end(), 0.0);
+        std::fill(tot.begin(), tot.end(), 0.0);
+        mse = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const float x = P[2*i], y = P[2*i + 1];
+            int   best = 0;
+            float bd   = INFINITY;
+            for (int c = 0; c < K; ++c) {
+                const float dx = x - C[2*c], dy = y - C[2*c + 1];
+                const float d  = dx*dx + dy*dy;
+                if (d < bd) { bd = d; best = c; }
+            }
+            lab[i] = best;
+            mse   += bd;
+            cnt[best]       += w[i];
+            tot[2*best]     += (double) x * w[i];
+            tot[2*best + 1] += (double) y * w[i];
+        }
+        mse /= (double) n;
+        for (int c = 0; c < K; ++c) {
+            if (cnt[c] > 0.0) {
+                C[2*c]     = (float) (tot[2*c]     / cnt[c]);
+                C[2*c + 1] = (float) (tot[2*c + 1] / cnt[c]);
+            } else {
+                const size_t f = std::uniform_int_distribution<size_t>(0, n - 1)(rng);
+                C[2*c] = P[2*f]; C[2*c + 1] = P[2*f + 1];
+            }
+        }
+        if (it % 20 == 19 || it == ITERS - 1) {
+            LLAMA_LOG_INFO("%s: iter %3d  mse %.6e\n", __func__, it + 1, mse);
+        }
+    }
+
+    // order by radius, as the python fitter does, so tables from either route line up
+    std::vector<int> ord(K);
+    for (int c = 0; c < K; ++c) {
+        ord[c] = c;
+    }
+    std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+        return C[2*a]*C[2*a] + C[2*a+1]*C[2*a+1] < C[2*b]*C[2*b] + C[2*b+1]*C[2*b+1];
+    });
+    std::vector<float> out((size_t) K * 2);
+    for (int c = 0; c < K; ++c) {
+        out[2*c]     = C[2*ord[c]];
+        out[2*c + 1] = C[2*ord[c] + 1];
+    }
+    LLAMA_LOG_INFO("%s: K=%d fitted on %zu pairs (alpha %.2f, seed %u), mse %.6e\n",
+                   __func__, K, n, alpha, seed, mse);
+    return out;
+}
+
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
@@ -1015,6 +1224,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case GGML_TYPE_NEURON_V4:
         case GGML_TYPE_NEURON_V5:
         case GGML_TYPE_NEURON_V6: {
+            // Fit on this model's own weights, if asked. Done here, before any tensor is
+            // encoded, so the table that goes into the file is the one that encoded it.
+            if (params->neuron_fit_codebook) {
+                const std::vector<float> fit = llama_neuron_fit_codebook(
+                        ml, default_type, params->neuron_fit_alpha, params->neuron_fit_seed);
+                if (!fit.empty()) {
+                    ggml_neuron_vq_set_codebook(default_type, fit.data());
+                }
+            }
             gguf_set_val_u64(ctx_out.get(), "neuron.vq_codebook",
                              ggml_neuron_vq_codebook_hash());
             // beta4: carry the table itself, whatever was bound for the encode. A file that
@@ -1419,7 +1637,10 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.neuron_fit_codebook          =*/ false,
+        /*.neuron_fit_seed              =*/ 0,
+        /*.neuron_fit_alpha             =*/ 1.5f
     };
 
     return result;

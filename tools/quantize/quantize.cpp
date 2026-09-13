@@ -180,6 +180,12 @@ static void usage(const char * executable) {
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("                                      override model metadata by key in the quantized model. may be specified multiple times.\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
+    printf("  --neuron-fit [--neuron-fit-seed N] [--neuron-fit-alpha A]\n");
+    printf("                                      NEURON_V*: fit the codebook on this model's own weights\n");
+    printf("                                      during the quantise, and carry it in the output. The fit is\n");
+    printf("                                      non-convex, so the seed is part of the result (default 0, alpha 1.5)\n");
+    printf("  --neuron-codebook FNAME\n");
+    printf("                                      NEURON_V*: encode against a table from experiments/fit_vq.py\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
@@ -464,6 +470,22 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--override-kv") == 0) {
             if (arg_idx == argc-1 || !string_parse_kv_override(argv[++arg_idx], kv_overrides)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--neuron-fit") == 0) {
+            params.neuron_fit_codebook = true;
+        } else if (strcmp(argv[arg_idx], "--neuron-fit-seed") == 0) {
+            if (arg_idx < argc-1) {
+                params.neuron_fit_codebook = true;
+                params.neuron_fit_seed = (uint32_t) std::stoul(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--neuron-fit-alpha") == 0) {
+            if (arg_idx < argc-1) {
+                params.neuron_fit_codebook = true;
+                params.neuron_fit_alpha = std::stof(argv[++arg_idx]);
+            } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--neuron-codebook") == 0) {
