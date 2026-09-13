@@ -355,6 +355,62 @@ void quantize_neuron_v##SFX(device const float * src, device block_neuron_v##SFX
    Deliberately NOT folded into quantize_neuron_v* above: that one encodes the KV cache and
    runs per token, where paying NSBT times the work to save a fraction of a bit would be a
    bad trade. Weights are encoded once. */
+/* Exact nearest codeword, using the one index the table already carries: it is sorted by
+   radius, so |len(c) - len(q)| <= |q - c| bounds below the distance to every codeword at a
+   given radius. Binary search to the query's radius, walk outward on both sides, and stop
+   each side once that bound exceeds the best distance found. Touches the codewords in a thin
+   annulus -- about 2*sqrt(K) of them -- rather than all K, and needs no structure built,
+   shipped or substituted.
+
+   Relies on the table being radius-sorted. Both fitters order by radius, and all three
+   shipped tables sort with zero violations. */
+#define NEURON_V_NN(SFX)                                                                  \
+static inline int neuron_vq##SFX##_nn_gpu(float qx, float qy, thread float & out_d2) {    \
+    const int   K  = NEURON_VQ##SFX##_K;                                                  \
+    const float qn = qx*qx + qy*qy;                                                       \
+    const float qr = sqrt(qn);                                                            \
+    int lo = 0, hi = K - 1;                                                               \
+    while (lo < hi) {                                                                     \
+        const int m = (lo + hi) >> 1;                                                     \
+        const float cx = kNeuronVQ##SFX[2*m], cy = kNeuronVQ##SFX[2*m + 1];               \
+        if (cx*cx + cy*cy < qn) { lo = m + 1; } else { hi = m; }                          \
+    }                                                                                     \
+    int   bc = lo < K ? lo : K - 1;                                                       \
+    float bd = INFINITY;                                                                  \
+    float lim_hi = INFINITY, lim_lo = 0.0f;                                               \
+    for (int c = lo; c < K; ++c) {                                                        \
+        const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];               \
+        if (cx*cx + cy*cy > lim_hi) { break; }                                            \
+        const float dx = qx - cx, dy = qy - cy;                                           \
+        const float d  = dx*dx + dy*dy;                                                   \
+        if (d < bd) {                                                                     \
+            bd = d; bc = c;                                                               \
+            const float s = sqrt(bd);                                                     \
+            const float u = qr + s, l = qr - s;                                           \
+            lim_hi = u*u;                                                                 \
+            lim_lo = l > 0.0f ? l*l : 0.0f;                                               \
+        }                                                                                 \
+    }                                                                                     \
+    for (int c = lo - 1; c >= 0; --c) {                                                   \
+        const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];               \
+        if (cx*cx + cy*cy < lim_lo) { break; }                                            \
+        const float dx = qx - cx, dy = qy - cy;                                           \
+        const float d  = dx*dx + dy*dy;                                                   \
+        if (d < bd) {                                                                     \
+            bd = d; bc = c;                                                               \
+            const float s = sqrt(bd);                                                     \
+            const float l = qr - s;                                                       \
+            lim_lo = l > 0.0f ? l*l : 0.0f;                                               \
+        }                                                                                 \
+    }                                                                                     \
+    out_d2 = bd;                                                                          \
+    return bc;                                                                            \
+}
+
+NEURON_V_NN(4)
+NEURON_V_NN(5)
+NEURON_V_NN(6)
+
 #define NEURON_V_QUANT_SS(SFX)                                                            \
 void quantize_neuron_v##SFX##_ss(device const float * src, device block_neuron_v##SFX & dst) { \
     const int NP  = QK_NEURON / 2;                                                        \
@@ -389,13 +445,9 @@ void quantize_neuron_v##SFX##_ss(device const float * src, device block_neuron_v
             for (int t = 0; t < PSB; ++t) {                                               \
                 const int   p  = sblk*PSB + t;                                            \
                 const float ax = src[2*p] * ij, ay = src[2*p + 1] * ij;                   \
-                float bv = -INFINITY;                                                     \
-                for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                            \
-                    const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];   \
-                    const float v  = 2.0f*(ax*cx + ay*cy) - (cx*cx + cy*cy);              \
-                    if (v > bv) { bv = v; }                                               \
-                }                                                                         \
-                sse += (ax*ax + ay*ay - bv) * gj * gj;                                    \
+                float d2 = 0.0f;                                                          \
+                neuron_vq##SFX##_nn_gpu(ax, ay, d2);                                      \
+                sse += d2 * gj * gj;                                                      \
             }                                                                             \
             if (sse < mb) { mb = sse; mj = j; }                                           \
         }                                                                                 \
@@ -409,13 +461,8 @@ void quantize_neuron_v##SFX##_ss(device const float * src, device block_neuron_v
         for (int t = 0; t < PSB; ++t) {                                                   \
             const int   p  = sblk*PSB + t;                                                \
             const float ax = src[2*p] * inv, ay = src[2*p + 1] * inv;                     \
-            int   bc = 0;                                                                 \
-            float bv = -INFINITY;                                                         \
-            for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                \
-                const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];       \
-                const float v  = 2.0f*(ax*cx + ay*cy) - (cx*cx + cy*cy);                  \
-                if (v > bv) { bv = v; bc = c; }                                           \
-            }                                                                             \
+            float d2 = 0.0f;                                                              \
+            const int bc = neuron_vq##SFX##_nn_gpu(ax, ay, d2);                           \
             const int bit = p * B;                                                        \
             qbuf[bit >> 3] |= (uint8_t)(bc << (bit & 7));                                 \
             if (((bit & 7) + B) > 8)  { qbuf[(bit >> 3) + 1] |= (uint8_t)(bc >> (8 - (bit & 7))); }\

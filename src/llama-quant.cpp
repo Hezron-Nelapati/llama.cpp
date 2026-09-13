@@ -1,4 +1,5 @@
 #include "llama-impl.h"
+#include "ggml-backend.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
 #include "llama-ext.h"
@@ -1003,8 +1004,97 @@ static std::vector<float> llama_neuron_fit_codebook(
     return out;
 }
 
+// Encode weights on the GPU. llama-quantize has no backend of its own, so this brings one
+// up on first use and runs a single-node CPY graph: an F32 source into a neuron_v* tensor,
+// which kernel_cpy_f32_neuron_v* fills using the searching encoder.
+//
+// Returns false for anything it cannot take -- no GPU, a type it has no kernel for, or a
+// chunk too large to stage -- and the caller falls back to the CPU path unchanged.
+static ggml_backend_t llama_quant_gpu_backend(void) {
+    static bool          tried = false;
+    static ggml_backend_t be   = nullptr;
+    if (!tried) {
+        tried = true;
+        if (getenv("LLAMA_QUANT_NO_GPU") == nullptr) {
+            be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+            if (be) {
+                LLAMA_LOG_INFO("%s: encoding on %s\n", __func__, ggml_backend_name(be));
+            }
+        }
+    }
+    return be;
+}
+
+static bool llama_quant_gpu_supported(ggml_type t) {
+    return t == GGML_TYPE_NEURON_V4 || t == GGML_TYPE_NEURON_V5 || t == GGML_TYPE_NEURON_V6;
+}
+
+static bool llama_tensor_quantize_gpu(
+        ggml_type new_type, const float * f32_data, void * new_data,
+        int64_t nrows, int64_t n_per_row, size_t * out_size) {
+    if (!llama_quant_gpu_supported(new_type)) {
+        return false;
+    }
+    ggml_backend_t be = llama_quant_gpu_backend();
+    if (!be) {
+        return false;
+    }
+
+    const size_t src_bytes = (size_t) nrows * n_per_row * sizeof(float);
+    const size_t dst_bytes = (size_t) nrows * ggml_row_size(new_type, n_per_row);
+
+    // one staging pass; anything bigger stays on the CPU rather than risk the allocation
+    if (src_bytes + dst_bytes > (size_t) 2*1024*1024*1024ull) {
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*4 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_per_row, nrows);
+    ggml_tensor * dst = ggml_new_tensor_2d(ctx, new_type,      n_per_row, nrows);
+    ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, cpy);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(src, f32_data, 0, src_bytes);
+    const ggml_status st = ggml_backend_graph_compute(be, gf);
+    if (st == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(dst, new_data, 0, dst_bytes);
+        *out_size = dst_bytes;
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return st == GGML_STATUS_SUCCESS;
+}
+
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
+
+    // The neuron v* encoder is the whole cost of a quantise and it is embarrassingly
+    // parallel over blocks, so hand the chunk to the GPU when one is there. Falls through
+    // to the CPU path below for every other type, and whenever the GPU declines.
+    {
+        size_t gpu_size = 0;
+        if (llama_tensor_quantize_gpu(new_type, f32_data, new_data, nrows, n_per_row, &gpu_size)) {
+            return gpu_size;
+        }
+    }
 
     auto imatrix_for_row = [=](int64_t row_global) {
         return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
