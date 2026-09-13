@@ -100,6 +100,16 @@ static bool striequals(const char * a, const char * b) {
     return *a == *b;
 }
 
+// Which v-type an ftype asks for, or GGML_TYPE_COUNT if it is not a neuron v* ftype.
+static ggml_type neuron_vq_type_of(llama_ftype ftype) {
+    switch (ftype) {
+        case LLAMA_FTYPE_MOSTLY_NEURON_V4: return GGML_TYPE_NEURON_V4;
+        case LLAMA_FTYPE_MOSTLY_NEURON_V5: return GGML_TYPE_NEURON_V5;
+        case LLAMA_FTYPE_MOSTLY_NEURON_V6: return GGML_TYPE_NEURON_V6;
+        default: return GGML_TYPE_COUNT;
+    }
+}
+
 static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftype, std::string & ftype_str_out) {
     std::string ftype_str;
 
@@ -413,6 +423,7 @@ int llama_quantize(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string neuron_codebook_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_type_option> tensor_type_opts;
@@ -453,6 +464,12 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--override-kv") == 0) {
             if (arg_idx == argc-1 || !string_parse_kv_override(argv[++arg_idx], kv_overrides)) {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--neuron-codebook") == 0) {
+            if (arg_idx < argc-1) {
+                neuron_codebook_file = argv[++arg_idx];
+            } else {
                 usage(argv[0]);
             }
         } else if (strcmp(argv[arg_idx], "--dry-run") == 0) {
@@ -651,6 +668,33 @@ int llama_quantize(int argc, char ** argv) {
     const int64_t t_main_start_us = llama_time_us();
 
     int64_t t_quantize_us = 0;
+
+    // beta4: encode against a codebook fitted on this model's own weights. The table is
+    // bound before quantising and llama_model_quantize_impl reads it straight back out to
+    // embed in the output, so the file that results describes its own decoder.
+    std::vector<float> neuron_codebook;
+    if (!neuron_codebook_file.empty()) {
+        const ggml_type nt = neuron_vq_type_of(params.ftype);
+        if (nt == GGML_TYPE_COUNT) {
+            fprintf(stderr, "%s: --neuron-codebook needs a NEURON_V* ftype\n", __func__);
+            return 1;
+        }
+        const int K = ggml_neuron_vq_codebook_size(nt);
+        std::ifstream f(neuron_codebook_file, std::ios::binary);
+        if (!f) {
+            fprintf(stderr, "%s: cannot open %s\n", __func__, neuron_codebook_file.c_str());
+            return 1;
+        }
+        neuron_codebook.resize((size_t) K * 2);
+        f.read((char *) neuron_codebook.data(), (std::streamsize) neuron_codebook.size() * sizeof(float));
+        if (f.gcount() != (std::streamsize) (neuron_codebook.size() * sizeof(float)) || f.peek() != EOF) {
+            fprintf(stderr, "%s: %s is not %d pairs of f32 (%zu bytes expected)\n", __func__,
+                    neuron_codebook_file.c_str(), K, neuron_codebook.size() * sizeof(float));
+            return 1;
+        }
+        ggml_neuron_vq_set_codebook(nt, neuron_codebook.data());
+        fprintf(stderr, "%s: codebook <- %s (%d pairs)\n", __func__, neuron_codebook_file.c_str(), K);
+    }
 
     // load the model
     {

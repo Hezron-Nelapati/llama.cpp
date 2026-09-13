@@ -6153,13 +6153,22 @@ NEURON_QUANTIZE(5) NEURON_QUANTIZE(6) NEURON_QUANTIZE(7) NEURON_QUANTIZE(8)
 //
 // FNV-1a over the raw bytes of every table a v* decoder can read. Any refit, any change of
 // K, any change to the sub-block multipliers moves it.
+const float * ggml_neuron_vq4_get_codebook(void);
+const float * ggml_neuron_vq5_get_codebook(void);
+const float * ggml_neuron_vq6_get_codebook(void);
+
 uint64_t ggml_neuron_vq_codebook_hash(void) {
     uint64_t h = 1469598103934665603ULL;
     const unsigned char * spans[5];
     size_t                lens [5];
-    spans[0] = (const unsigned char *) kNeuronVQ4;   lens[0] = sizeof(kNeuronVQ4);
-    spans[1] = (const unsigned char *) kNeuronVQ5;   lens[1] = sizeof(kNeuronVQ5);
-    spans[2] = (const unsigned char *) kNeuronVQ6;   lens[2] = sizeof(kNeuronVQ6);
+    // The ACTIVE tables, not the compiled-in ones. With no per-model codebook bound these
+    // are the same pointers and the hash is unchanged, so existing files still validate.
+    // With one bound they differ, and that is the point: a build too old to read
+    // neuron.vq.codebook must see a mismatched stamp and refuse, rather than decode the
+    // file against its own table and produce fluent garbage.
+    spans[0] = (const unsigned char *) ggml_neuron_vq4_get_codebook(); lens[0] = sizeof(kNeuronVQ4);
+    spans[1] = (const unsigned char *) ggml_neuron_vq5_get_codebook(); lens[1] = sizeof(kNeuronVQ5);
+    spans[2] = (const unsigned char *) ggml_neuron_vq6_get_codebook(); lens[2] = sizeof(kNeuronVQ6);
     spans[3] = (const unsigned char *) kNeuronVQSB;  lens[3] = sizeof(kNeuronVQSB);
     spans[4] = (const unsigned char *) kNeuronVQSB64;lens[4] = sizeof(kNeuronVQSB64);
     for (int i = 0; i < 5; ++i) {
@@ -6239,13 +6248,17 @@ static void neuron_vq_scales(const float * GGML_RESTRICT cb, const float * GGML_
 static float g_vq##SFX##_cn[NEURON_VQ##SFX##_K];                                           \
 static int   g_vq##SFX##_ord[NEURON_VQ##SFX##_K];  /* codewords by cn ascending */         \
 static bool  g_vq##SFX##_ready = false;                                                    \
+/* The active table. Defaults to the shipped constant, so a build with no per-model    */ \
+/* codebook behaves exactly as before. ggml_neuron_vq_set_codebook rebinds it to a     */ \
+/* table carried in the model file, and clears the cached hull sort derived from it.   */ \
+static const float * g_vq##SFX##_tbl = kNeuronVQ##SFX;                                    \
                                                                                            \
 static void neuron_vq##SFX##_init(void) {                                                  \
     if (g_vq##SFX##_ready) {                                                               \
         return;                                                                            \
     }                                                                                      \
     for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                         \
-        const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];                \
+        const float cx = g_vq##SFX##_tbl[2*c], cy = g_vq##SFX##_tbl[2*c + 1];                \
         g_vq##SFX##_cn[c] = cx*cx + cy*cy;                                                 \
     }                                                                                      \
     /* the hull query walks codewords in cn order, and cn is a global constant, so         \
@@ -6269,7 +6282,7 @@ static inline int neuron_vq##SFX##_best(float ax, float ay, float g, float * GGM
     int   best  = 0;                                                                       \
     float bestv = -INFINITY;                                                               \
     for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                         \
-        const float v = 2.0f*g*(ax*kNeuronVQ##SFX[2*c] + ay*kNeuronVQ##SFX[2*c + 1])       \
+        const float v = 2.0f*g*(ax*g_vq##SFX##_tbl[2*c] + ay*g_vq##SFX##_tbl[2*c + 1])       \
                       - g*g*g_vq##SFX##_cn[c];                                             \
         if (v > bestv) {                                                                   \
             bestv = v;                                                                     \
@@ -6329,7 +6342,7 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
                     const int p = sblk*PSB + t;                                            \
                     int   pc[64];                                                          \
                     float ps[64];                                                          \
-                    neuron_vq_scales(kNeuronVQ##SFX, g_vq##SFX##_cn, g_vq##SFX##_ord,      \
+                    neuron_vq_scales(g_vq##SFX##_tbl, g_vq##SFX##_cn, g_vq##SFX##_ord,      \
                                      NEURON_VQ##SFX##_K, xb[2*p], xb[2*p + 1],             \
                                      gv, NM, pc, ps, hdot, hidx);                 \
                     for (int j = 0; j < NM; ++j) {                                         \
@@ -6352,8 +6365,8 @@ void quantize_row_neuron_v##SFX##_ref(const float * GGML_RESTRICT x,            
             float num = 0.0f, den = 0.0f;                                                  \
             for (int p = 0; p < NP; ++p) {                                                 \
                 const float m = NEURON_VQ##SFX##_SBT[mi[p / PSB]];                         \
-                num += m * (xb[2*p]     * kNeuronVQ##SFX[2*cs[p]]                          \
-                          + xb[2*p + 1] * kNeuronVQ##SFX[2*cs[p] + 1]);                    \
+                num += m * (xb[2*p]     * g_vq##SFX##_tbl[2*cs[p]]                          \
+                          + xb[2*p + 1] * g_vq##SFX##_tbl[2*cs[p] + 1]);                    \
                 den += m * m * g_vq##SFX##_cn[cs[p]];                                      \
             }                                                                              \
             if (den <= 0.0f || num <= 0.0f) {                                              \
@@ -6401,8 +6414,8 @@ void dequantize_row_neuron_v##SFX(const block_neuron_v##SFX * GGML_RESTRICT x,  
                                  & ((1u << NEURON_VQ##SFX##_SBB) - 1u)];                   \
             const uint32_t c = neuron_bits(x[i].qs, p * NEURON_VQ##SFX##_BITS,             \
                                            NEURON_VQ##SFX##_BITS);                         \
-            yb[2*p]     = g * kNeuronVQ##SFX[2*c];                                         \
-            yb[2*p + 1] = g * kNeuronVQ##SFX[2*c + 1];                                     \
+            yb[2*p]     = g * g_vq##SFX##_tbl[2*c];                                         \
+            yb[2*p + 1] = g * g_vq##SFX##_tbl[2*c + 1];                                     \
         }                                                                                  \
     }                                                                                      \
 }                                                                                          \
@@ -6419,8 +6432,59 @@ size_t quantize_neuron_v##SFX(const float * GGML_RESTRICT src, void * GGML_RESTR
         qrow += row_size;                                                                  \
     }                                                                                      \
     return nrow * row_size;                                                                \
+}                                                                                          \
+                                                                                           \
+/* Rebind the table this type encodes and decodes with. NULL restores the shipped one.  */ \
+/* Called once per model at load, before any tensor of this type is touched.            */ \
+/*                                                                                      */ \
+/* The table is COPIED. Callers hand us a pointer into a gguf context, and the loader    */ \
+/* runs more than once per model -- the first pass frees its context before the second   */ \
+/* reads the table back, so aliasing the caller's buffer is a use-after-free that shows  */ \
+/* up as a codebook full of zeros and a spurious mismatch.                               */ \
+static float g_vq##SFX##_own[2 * NEURON_VQ##SFX##_K];                                      \
+void ggml_neuron_vq##SFX##_set_codebook(const float * tbl) {                               \
+    if (tbl) {                                                                             \
+        memcpy(g_vq##SFX##_own, tbl, sizeof(g_vq##SFX##_own));                             \
+        g_vq##SFX##_tbl = g_vq##SFX##_own;                                                 \
+    } else {                                                                               \
+        g_vq##SFX##_tbl = kNeuronVQ##SFX;                                                  \
+    }                                                                                      \
+    g_vq##SFX##_ready = false;   /* cn/ord are derived from the table; refit them */       \
+    neuron_vq##SFX##_init();                                                               \
+}                                                                                          \
+                                                                                           \
+const float * ggml_neuron_vq##SFX##_get_codebook(void) {                                   \
+    return g_vq##SFX##_tbl;                                                                \
 }
 
 NEURON_V_IMPL(4)
 NEURON_V_IMPL(5)
 NEURON_V_IMPL(6)
+
+// Dispatch by type, so callers outside this file need not know the suffix scheme.
+void ggml_neuron_vq_set_codebook(enum ggml_type type, const float * tbl) {
+    switch (type) {
+        case GGML_TYPE_NEURON_V4: ggml_neuron_vq4_set_codebook(tbl); break;
+        case GGML_TYPE_NEURON_V5: ggml_neuron_vq5_set_codebook(tbl); break;
+        case GGML_TYPE_NEURON_V6: ggml_neuron_vq6_set_codebook(tbl); break;
+        default: break;
+    }
+}
+
+const float * ggml_neuron_vq_get_codebook(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_NEURON_V4: return ggml_neuron_vq4_get_codebook();
+        case GGML_TYPE_NEURON_V5: return ggml_neuron_vq5_get_codebook();
+        case GGML_TYPE_NEURON_V6: return ggml_neuron_vq6_get_codebook();
+        default: return NULL;
+    }
+}
+
+int ggml_neuron_vq_codebook_size(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_NEURON_V4: return NEURON_VQ4_K;
+        case GGML_TYPE_NEURON_V5: return NEURON_VQ5_K;
+        case GGML_TYPE_NEURON_V6: return NEURON_VQ6_K;
+        default: return 0;
+    }
+}

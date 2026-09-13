@@ -1014,10 +1014,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     switch (default_type) {
         case GGML_TYPE_NEURON_V4:
         case GGML_TYPE_NEURON_V5:
-        case GGML_TYPE_NEURON_V6:
+        case GGML_TYPE_NEURON_V6: {
             gguf_set_val_u64(ctx_out.get(), "neuron.vq_codebook",
                              ggml_neuron_vq_codebook_hash());
-            break;
+            // beta4: carry the table itself, whatever was bound for the encode. A file that
+            // describes its own decoder cannot be read against the wrong book, which is the
+            // failure the hash above can only detect after the fact. K pairs of f32: 8 KiB
+            // for v5, against a multi-gigabyte file.
+            const float * tbl = ggml_neuron_vq_get_codebook(default_type);
+            const int     K   = ggml_neuron_vq_codebook_size(default_type);
+            if (tbl && K > 0) {
+                gguf_set_arr_data(ctx_out.get(), "neuron.vq.codebook",
+                                  GGUF_TYPE_FLOAT32, tbl, (size_t) K * 2);
+            }
+        } break;
         default:
             break;
     }

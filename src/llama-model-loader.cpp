@@ -768,15 +768,47 @@ llama_model_loader::llama_model_loader(
                 // fluent garbage and no error at all. Refitting the tables on true bf16
                 // weights invalidated every earlier v* file exactly this way, and it went
                 // unnoticed because perplexity against the matching binary looked sane.
-                const int kid = gguf_find_key(metadata, "neuron.vq_codebook");
-                const uint64_t want = ggml_neuron_vq_codebook_hash();
-                const uint64_t got  = kid < 0 ? 0 : gguf_get_val_u64(metadata, kid);
-                if (got != want) {
-                    throw std::runtime_error(format(
-                        "%s: this model was quantised against a different neuron v* codebook "
-                        "(file %016llx, build %016llx). The codebook is part of the format; "
-                        "requantise with this build.", __func__,
-                        (unsigned long long) got, (unsigned long long) want));
+                // beta4: a file may carry its own table, fitted on its own weights. Then it
+                // describes its own decoder and the build's table is irrelevant -- bind it and
+                // the hash below never comes into it.
+                const int cbid = gguf_find_key(metadata, "neuron.vq.codebook");
+                if (cbid >= 0) {
+                    const int      K   = ggml_neuron_vq_codebook_size(type_max);
+                    const size_t   n   = gguf_get_arr_n(metadata, cbid);
+                    const enum gguf_type at = gguf_get_arr_type(metadata, cbid);
+                    if (at != GGUF_TYPE_FLOAT32 || n != (size_t) K * 2) {
+                        throw std::runtime_error(format(
+                            "%s: neuron.vq.codebook is %zu values of type %d, expected %d f32",
+                            __func__, n, (int) at, K * 2));
+                    }
+                    const float * tbl = (const float *) gguf_get_arr_data(metadata, cbid);
+
+                    // Only the CPU encoder and decoder read the bound table today. The Metal
+                    // kernels still stage the compile-time constant, so a book that differs
+                    // from the build's would decode correctly on CPU and silently wrongly on
+                    // GPU -- the exact failure this whole change exists to remove. Refuse it
+                    // until the table travels to the kernels as a buffer.
+                    const float * own = ggml_neuron_vq_get_codebook(type_max);
+                    if (own && memcmp(own, tbl, (size_t) K * 2 * sizeof(float)) != 0) {
+                        throw std::runtime_error(format(
+                            "%s: this model carries its own neuron v* codebook, which the GPU "
+                            "kernels cannot use yet -- they still read the table compiled into "
+                            "the build. Refusing rather than decoding correctly on CPU and "
+                            "wrongly on GPU.", __func__));
+                    }
+                    ggml_neuron_vq_set_codebook(type_max, tbl);
+                } else {
+                    // Legacy file: the table lives in the build, so the hash must match.
+                    const int kid = gguf_find_key(metadata, "neuron.vq_codebook");
+                    const uint64_t want = ggml_neuron_vq_codebook_hash();
+                    const uint64_t got  = kid < 0 ? 0 : gguf_get_val_u64(metadata, kid);
+                    if (got != want) {
+                        throw std::runtime_error(format(
+                            "%s: this model was quantised against a different neuron v* codebook "
+                            "(file %016llx, build %016llx). The codebook is part of the format; "
+                            "requantise with this build.", __func__,
+                            (unsigned long long) got, (unsigned long long) want));
+                    }
                 }
                 ftype = type_max == GGML_TYPE_NEURON_V4 ? LLAMA_FTYPE_MOSTLY_NEURON_V4
                       : type_max == GGML_TYPE_NEURON_V5 ? LLAMA_FTYPE_MOSTLY_NEURON_V5

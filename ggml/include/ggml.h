@@ -2958,6 +2958,14 @@ extern "C" {
     // as "neuron.vq_codebook" and the loader refuses a mismatch.
     GGML_API uint64_t ggml_neuron_vq_codebook_hash(void);
 
+    // beta4: bind the codebook a model carries in its own file. Pass NULL to restore the
+    // shipped table. Scope is the whole model -- one table, every tensor -- so this is set
+    // once at load, before any tensor of the type is encoded or decoded. Rebinding clears
+    // the cached hull ordering, which is derived from the table.
+    GGML_API void          ggml_neuron_vq_set_codebook (enum ggml_type type, const float * tbl);
+    GGML_API const float * ggml_neuron_vq_get_codebook (enum ggml_type type);
+    GGML_API int           ggml_neuron_vq_codebook_size(enum ggml_type type);  // K, in pairs
+
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(
             enum ggml_type   type,
