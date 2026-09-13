@@ -319,6 +319,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_NEURON_M3,
     GGML_TYPE_NEURON_M4,
     GGML_TYPE_NEURON_M5,
+    GGML_TYPE_NEURON_V4,
+    GGML_TYPE_NEURON_V5,
+    GGML_TYPE_NEURON_V6,
     GGML_TYPE_NEURON_M6,
     GGML_TYPE_NEURON_M7,
 };
