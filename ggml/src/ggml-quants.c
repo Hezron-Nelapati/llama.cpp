@@ -6455,6 +6455,10 @@ void ggml_neuron_vq##SFX##_set_codebook(const float * tbl) {                    
                                                                                            \
 const float * ggml_neuron_vq##SFX##_get_codebook(void) {                                   \
     return g_vq##SFX##_tbl;                                                                \
+}                                                                                          \
+                                                                                           \
+bool ggml_neuron_vq##SFX##_is_custom(void) {                                               \
+    return g_vq##SFX##_tbl != kNeuronVQ##SFX;                                              \
 }
 
 NEURON_V_IMPL(4)
@@ -6477,6 +6481,18 @@ const float * ggml_neuron_vq_get_codebook(enum ggml_type type) {
         case GGML_TYPE_NEURON_V5: return ggml_neuron_vq5_get_codebook();
         case GGML_TYPE_NEURON_V6: return ggml_neuron_vq6_get_codebook();
         default: return NULL;
+    }
+}
+
+bool ggml_neuron_vq_codebook_is_custom(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_NEURON_V4: return ggml_neuron_vq4_is_custom();
+        case GGML_TYPE_NEURON_V5: return ggml_neuron_vq5_is_custom();
+        case GGML_TYPE_NEURON_V6: return ggml_neuron_vq6_is_custom();
+        case GGML_TYPE_COUNT:     return ggml_neuron_vq4_is_custom() ||
+                                         ggml_neuron_vq5_is_custom() ||
+                                         ggml_neuron_vq6_is_custom();
+        default: return false;
     }
 }
 

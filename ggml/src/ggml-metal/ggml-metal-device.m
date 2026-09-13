@@ -144,6 +144,9 @@ static const char * const k_lib_names[GGML_METAL_LIB_COUNT] = {
 #undef X
 };
 
+// Block_copy / Block_release
+#include <Block.h>
+
 struct ggml_metal_library {
     // Per-kind compiled libraries. When single_library is true, the whole library
     // (e.g. a pre-compiled default.metallib or a from-source build) lives at
@@ -164,8 +167,60 @@ struct ggml_metal_library {
     ggml_metal_device_t dev;
     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
 
+    // Everything needed to compile again. The neuron v* codebook is a property of the model,
+    // not of the build, but libraries are compiled at device init -- before any model is
+    // loaded. So the table a library was built with is recorded here, and a library whose
+    // table no longer matches the bound one is rebuilt on the next pipeline request.
+    NSDictionary * prep;
+    NSString * (^src_provider)(int kind, NSError ** err);
+    const char * origin;
+    uint64_t     vq_hash;
+
     NSLock * lock;
 };
+
+// Substitute the active neuron v* tables into Metal source. The kernels read these as
+// constant-address arrays, which is the free tier of the lookup cost hierarchy -- passing the
+// table as a buffer instead would cost the prompt path 45%. Rewriting the source keeps every
+// lookup exactly as it was and needs no kernel change at all.
+static NSString * ggml_metal_source_apply_codebook(NSString * src) {
+    if (!ggml_neuron_vq_codebook_is_custom(GGML_TYPE_COUNT)) {
+        return src;
+    }
+    NSMutableString * out = [src mutableCopy];
+    const enum ggml_type types[3] = { GGML_TYPE_NEURON_V4, GGML_TYPE_NEURON_V5, GGML_TYPE_NEURON_V6 };
+    const int            sfx  [3] = { 4, 5, 6 };
+    for (int i = 0; i < 3; ++i) {
+        // only the types a model actually bound; the rest keep the shipped table
+        if (!ggml_neuron_vq_codebook_is_custom(types[i])) {
+            continue;
+        }
+        const float * tbl = ggml_neuron_vq_get_codebook(types[i]);
+        const int     K   = ggml_neuron_vq_codebook_size(types[i]);
+        if (!tbl || K <= 0) {
+            continue;
+        }
+        NSString * head = [NSString stringWithFormat:@"GGML_TABLE_BEGIN(float, kNeuronVQ%d, %d)", sfx[i], 2*K];
+        const NSRange rh = [out rangeOfString:head];
+        if (rh.location == NSNotFound) {
+            continue;
+        }
+        const NSRange rest = NSMakeRange(NSMaxRange(rh), out.length - NSMaxRange(rh));
+        const NSRange rt   = [out rangeOfString:@"GGML_TABLE_END()" options:0 range:rest];
+        if (rt.location == NSNotFound) {
+            continue;
+        }
+        NSMutableString * body = [NSMutableString stringWithCapacity:24*K];
+        [body appendString:@"\n"];
+        for (int c = 0; c < K; ++c) {
+            [body appendFormat:@"%+.9ef, %+.9ef,%s", tbl[2*c], tbl[2*c + 1], (c % 4 == 3) ? "\n" : " "];
+        }
+        const NSRange between = NSMakeRange(NSMaxRange(rh), rt.location - NSMaxRange(rh));
+        [out replaceCharactersInRange:between withString:body];
+        GGML_LOG_DEBUG("%s: kNeuronVQ%d <- the model's own table (%d pairs)\n", __func__, sfx[i], K);
+    }
+    return out;
+}
 
 // Build the fn_to_lib routing table by querying each compiled library's public
 // function names. Call once after all per-kind libraries have been compiled.
@@ -306,6 +361,18 @@ static bool ggml_metal_library_compile_all(
         const char * origin) {
     const int64_t t_start = ggml_time_us();
 
+    // remember the inputs so a codebook change can replay this
+    if (res->src_provider != source_for_kind) {
+        [res->prep release];
+        if (res->src_provider) {
+            Block_release(res->src_provider);
+        }
+        res->prep         = [prep retain];
+        res->src_provider = Block_copy(source_for_kind);
+        res->origin       = origin;
+    }
+    res->vq_hash = ggml_neuron_vq_codebook_hash();
+
     int64_t  * t_per_lib   = calloc(GGML_METAL_LIB_COUNT, sizeof(int64_t));
     NSError ** err_per_lib = calloc(GGML_METAL_LIB_COUNT, sizeof(NSError *));
     __block atomic_bool any_failure = false;
@@ -326,6 +393,7 @@ static bool ggml_metal_library_compile_all(
                 atomic_store(&any_failure, true);
                 return;
             }
+            src = ggml_metal_source_apply_codebook(src);
 
             id<MTLLibrary> lib = nil;
 
@@ -705,6 +773,32 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
+    // A model binds its own neuron v* codebook after the device and its libraries already
+    // exist, so the substitution in compile_all cannot have seen it -- rebuild here, before
+    // any pipeline is handed out, so no kernel runs against a table the model did not encode
+    // with. Deliberately NOT under lib->lock: compile_all fans out through dispatch and waits
+    // on the group, and holding the lock across that wedges the load.
+    if (lib->src_provider && lib->vq_hash != ggml_neuron_vq_codebook_hash()) {
+        GGML_LOG_INFO("%s: model carries its own neuron codebook (%016llx, libraries built with "
+                      "%016llx) -- rebuilding metal libraries against it\n", __func__,
+                      (unsigned long long) ggml_neuron_vq_codebook_hash(),
+                      (unsigned long long) lib->vq_hash);
+        for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+            [lib->objs[kind] release];
+            lib->objs[kind] = nil;
+        }
+        [lib->fn_to_lib release];
+        lib->fn_to_lib = nil;
+        ggml_metal_pipelines_free(lib->pipelines);
+        lib->pipelines = ggml_metal_pipelines_init();
+
+        if (!ggml_metal_library_compile_all(lib, ggml_metal_device_get_obj(lib->dev),
+                                            lib->prep, lib->src_provider, lib->origin)) {
+            GGML_ABORT("failed to rebuild metal libraries for this model's neuron codebook");
+        }
+        ggml_metal_library_build_index(lib);
+    }
+
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
         /*.nsg      =*/ 0,

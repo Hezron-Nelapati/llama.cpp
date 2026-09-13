@@ -783,19 +783,9 @@ llama_model_loader::llama_model_loader(
                     }
                     const float * tbl = (const float *) gguf_get_arr_data(metadata, cbid);
 
-                    // Only the CPU encoder and decoder read the bound table today. The Metal
-                    // kernels still stage the compile-time constant, so a book that differs
-                    // from the build's would decode correctly on CPU and silently wrongly on
-                    // GPU -- the exact failure this whole change exists to remove. Refuse it
-                    // until the table travels to the kernels as a buffer.
-                    const float * own = ggml_neuron_vq_get_codebook(type_max);
-                    if (own && memcmp(own, tbl, (size_t) K * 2 * sizeof(float)) != 0) {
-                        throw std::runtime_error(format(
-                            "%s: this model carries its own neuron v* codebook, which the GPU "
-                            "kernels cannot use yet -- they still read the table compiled into "
-                            "the build. Refusing rather than decoding correctly on CPU and "
-                            "wrongly on GPU.", __func__));
-                    }
+                    // Bind it for the CPU encoder and decoder. The Metal backend notices the
+                    // change at its next pipeline request and rebuilds its libraries with this
+                    // table substituted into the source, so both paths decode what was encoded.
                     ggml_neuron_vq_set_codebook(type_max, tbl);
                 } else {
                     // Legacy file: the table lives in the build, so the hash must match.

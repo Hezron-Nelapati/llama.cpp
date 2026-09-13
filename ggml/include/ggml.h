@@ -2965,6 +2965,8 @@ extern "C" {
     GGML_API void          ggml_neuron_vq_set_codebook (enum ggml_type type, const float * tbl);
     GGML_API const float * ggml_neuron_vq_get_codebook (enum ggml_type type);
     GGML_API int           ggml_neuron_vq_codebook_size(enum ggml_type type);  // K, in pairs
+    // a model's table is bound for this type; GGML_TYPE_COUNT asks "for any v-type"
+    GGML_API bool          ggml_neuron_vq_codebook_is_custom(enum ggml_type type);
 
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(
