@@ -492,6 +492,12 @@ template [[host_name("kernel_set_rows_f32_i64_neuron_m3")]]  kernel set_rows_qK_
 template [[host_name("kernel_set_rows_f32_i32_neuron_m3")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_m3, quantize_neuron_m3>;
 template [[host_name("kernel_set_rows_f32_i64_neuron_m4")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_m4, quantize_neuron_m4>;
 template [[host_name("kernel_set_rows_f32_i32_neuron_m4")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_m4, quantize_neuron_m4>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_v4")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_v4, quantize_neuron_v4>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_v4")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_v4, quantize_neuron_v4>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_v5")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_v5, quantize_neuron_v5>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_v5")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_v5, quantize_neuron_v5>;
+template [[host_name("kernel_set_rows_f32_i64_neuron_v6")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_v6, quantize_neuron_v6>;
+template [[host_name("kernel_set_rows_f32_i32_neuron_v6")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_v6, quantize_neuron_v6>;
 template [[host_name("kernel_set_rows_f32_i64_neuron_m5")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_m5, quantize_neuron_m5>;
 template [[host_name("kernel_set_rows_f32_i32_neuron_m5")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_NEURON, block_neuron_m5, quantize_neuron_m5>;
 template [[host_name("kernel_set_rows_f32_i64_neuron_m6")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_NEURON, block_neuron_m6, quantize_neuron_m6>;

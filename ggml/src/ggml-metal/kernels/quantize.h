@@ -272,6 +272,85 @@ void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
 // runs on every token written to the cache, so it takes the MEAN of the log magnitudes
 // rather than a true median (counting ranks was O(n^2) and cost 2.4x in generation), and
 // it does no refit.
+// KV-cache encoder for the v family. Deliberately NOT the weight encoder: that one runs an
+// exhaustive search over every representable sub-block multiplier plus a convex-hull query
+// and a least-squares scale refit, which is affordable once per model and absurd once per
+// token. Here each sub-block takes the multiplier nearest its own absmax ratio in one pass,
+// and each pair takes its nearest codeword. Same block layout, so every decoder --
+// dequantize_neuron_v* in the mul_mm tiles and in flash attention -- is unchanged.
+//
+// Packing goes through a THREAD-local buffer and writes each byte to device memory exactly
+// once. Setting bits straight into dst.qs is a device read-modify-write per bit, and that,
+// not the search, is what made the polar KV path 2.4x slower than an f16 cache.
+#define NEURON_V_QUANT(SFX)                                                               \
+void quantize_neuron_v##SFX(device const float * src, device block_neuron_v##SFX & dst) { \
+    const int NP  = QK_NEURON / 2;                                                        \
+    const int PSB = NEURON_VQ_SBV / 2;                                                    \
+    const int B   = NEURON_VQ##SFX##_BITS;                                                \
+    const int SBB = NEURON_VQ##SFX##_SBB;                                                 \
+    const int NSBT = 1 << SBB;                                                            \
+                                                                                          \
+    float amax = 0.0f;                                                                    \
+    for (int j = 0; j < QK_NEURON; ++j) { amax = fmax(amax, fabs(src[j])); }              \
+    if (amax == 0.0f) {                                                                   \
+        dst.d = (half) 0.0f;                                                              \
+        for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { dst.sb[i] = 0; }                  \
+        for (int i = 0; i < NP * B / 8; ++i) { dst.qs[i] = 0; }                           \
+        return;                                                                           \
+    }                                                                                     \
+    dst.d = (half) amax;                                                                  \
+    const float d = (float) dst.d;                                                        \
+                                                                                          \
+    uint8_t sbuf[NEURON_VQ_SBBY(12)];          /* widest: 8 sub-blocks x 6 bits */        \
+    for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { sbuf[i] = 0; }                        \
+    uint8_t qbuf[QK_NEURON / 2 * 12 / 8];      /* widest: 64 pairs x 12 bits */           \
+    for (int i = 0; i < NP * B / 8; ++i) { qbuf[i] = 0; }                                 \
+                                                                                          \
+    for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                    \
+        /* sub-block absmax -> nearest representable multiplier, one pass, no search */   \
+        float sa = 0.0f;                                                                  \
+        for (int t = 0; t < NEURON_VQ_SBV; ++t) {                                         \
+            sa = fmax(sa, fabs(src[sblk*NEURON_VQ_SBV + t]));                             \
+        }                                                                                 \
+        const float want = sa / d;                                                        \
+        int   mj = 0;                                                                     \
+        float mb = INFINITY;                                                              \
+        for (int j = 0; j < NSBT; ++j) {                                                  \
+            const float e = fabs(NEURON_VQ##SFX##_SBT[j] - want);                         \
+            if (e < mb) { mb = e; mj = j; }                                               \
+        }                                                                                 \
+        const int sbit = sblk * SBB;                                                      \
+        sbuf[sbit >> 3] |= (uint8_t)(mj << (sbit & 7));                                   \
+        if (((sbit & 7) + SBB) > 8) {                                                     \
+            sbuf[(sbit >> 3) + 1] |= (uint8_t)(mj >> (8 - (sbit & 7)));                   \
+        }                                                                                 \
+                                                                                          \
+        const float g = d * NEURON_VQ##SFX##_SBT[mj];                                     \
+        const float inv = g > 0.0f ? 1.0f / g : 0.0f;                                     \
+        for (int t = 0; t < PSB; ++t) {                                                   \
+            const int   p  = sblk*PSB + t;                                                \
+            const float ax = src[2*p] * inv, ay = src[2*p + 1] * inv;                     \
+            int   bc = 0;                                                                 \
+            float bv = -INFINITY;                                                         \
+            for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                \
+                const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];       \
+                const float v  = 2.0f*(ax*cx + ay*cy) - (cx*cx + cy*cy);                  \
+                if (v > bv) { bv = v; bc = c; }                                           \
+            }                                                                             \
+            const int bit = p * B;                                                        \
+            qbuf[bit >> 3] |= (uint8_t)(bc << (bit & 7));                                 \
+            if (((bit & 7) + B) > 8)  { qbuf[(bit >> 3) + 1] |= (uint8_t)(bc >> (8 - (bit & 7))); }\
+            if (((bit & 7) + B) > 16) { qbuf[(bit >> 3) + 2] |= (uint8_t)(bc >> (16 - (bit & 7))); }\
+        }                                                                                 \
+    }                                                                                     \
+    for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { dst.sb[i] = sbuf[i]; }                \
+    for (int i = 0; i < NP * B / 8; ++i) { dst.qs[i] = qbuf[i]; }                         \
+}
+
+NEURON_V_QUANT(4)
+NEURON_V_QUANT(5)
+NEURON_V_QUANT(6)
+
 #define NEURON_QUANT(LP)                                                                    \
 void quantize_neuron_m##LP(device const float * src, device block_neuron_m##LP & dst) {   \
     const int nlv = 1 << (LP), last = nlv - 1, np = QK_NEURON / 2;                        \

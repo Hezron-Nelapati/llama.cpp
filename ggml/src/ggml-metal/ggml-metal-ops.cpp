@@ -2885,6 +2885,9 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
         case GGML_TYPE_NEURON_M5:
         case GGML_TYPE_NEURON_M6:
         case GGML_TYPE_NEURON_M7:
+        case GGML_TYPE_NEURON_V4:
+        case GGML_TYPE_NEURON_V5:
+        case GGML_TYPE_NEURON_V6:
             return true;
         default:
             break;
