@@ -515,6 +515,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_NEURON_V4 = 29, // except 1d tensors; v4 codebook, 4.375 bpw
     };
 
     // available tensor operations:
