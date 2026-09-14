@@ -84,20 +84,9 @@
 // activation slice -- four float4 loads amortised over N_R0 rows. v4 ran at 2 while v5 ran at
 // 8 and gained only +4.0% from the hoist against v5's +15.7%, having a quarter as many rows
 // to spread it over, so both now code 8.
-// 4, not 8. Eight rows per simdgroup holds eight accumulators plus yp[8] and fully unrolls a
-// 8x8 body, which costs occupancy -- and occupancy is what hides memory latency on a kernel
-// that is bandwidth-bound. Measured on qwen3-0.6B v4, interleaved against a Q4_0 reference to
-// cancel this machine's thermal drift:
-//
-//     N_R0=4   177.74 t/s   80.7 GB/s      <- and beats Q4_0 by 13.5% per byte
-//     N_R0=8   148.51 t/s   67.4 GB/s
-//     Q4_0     153.60 t/s   71.1 GB/s
-//
-// Only v4 was measured. The mechanism is the accumulator count and the unrolled body, which
-// are identical across the three, so v5/v6 follow the same reasoning -- but not the same data.
-#define N_R0_NEURON_V4  4
-#define N_R0_NEURON_V5  4
-#define N_R0_NEURON_V6  4
+#define N_R0_NEURON_V4  8
+#define N_R0_NEURON_V5  8
+#define N_R0_NEURON_V6  8
 #define N_SG_NEURON_V   2
 #define NEURON_V4_SMEM  (1024 + 64)             /*  256 half2 + 16 sub-block multipliers */
 #define NEURON_V5_SMEM  (4096 + 64)             /* 1024 half2 + 16 sub-block multipliers */
