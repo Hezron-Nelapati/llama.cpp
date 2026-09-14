@@ -87,6 +87,9 @@
 #define N_R0_NEURON_V4  8
 #define N_R0_NEURON_V5  8
 #define N_R0_NEURON_V6  8
+// LUT-GEMV experiment: rows each thread accumulates, 256 threads per threadgroup.
+#define NEURON_V4_LUT_ROWS 8
+#define NEURON_V4_LUT_SMEM (2*8*256*sizeof(float)) /* T: 2 units x 8 pairs x 256 cw */
 #define N_SG_NEURON_V   2
 #define NEURON_V4_SMEM  (1024 + 64)             /*  256 half2 + 16 sub-block multipliers */
 #define NEURON_V5_SMEM  (4096 + 64)             /* 1024 half2 + 16 sub-block multipliers */

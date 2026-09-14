@@ -3692,3 +3692,130 @@ kernel void kernel_mul_mv_neuron_v##SFX##_f32(                                  
 NEURON_V_MV_IMPL(4, 1)
 NEURON_V_MV_IMPL(5, 1)
 NEURON_V_MV_IMPL(6, 1)
+
+// ---------------------------------------------------------------------------------------
+// LUT-GEMV for neuron_v4 (T-MAC / LUT-GEMM family).
+//
+// A weight is g[i,p] * C[k[i,p]] and C is shared by the whole model, so the codeword multiply
+// does not depend on the output row:
+//
+//     y[i] = sum_p g[i,p] * ( C[k,0]*x[2p] + C[k,1]*x[2p+1] )
+//          = sum_p g[i,p] * T[p, k[i,p]]
+//
+// T depends only on the activation and the codebook. Build it once, reuse it for every row:
+// one multiply-add per PAIR instead of per weight. Costs N*K to build and M*N/2 to consume
+// against dense's M*N, so it only pays once M exceeds 2K = 512 rows -- which is why the
+// ordinary GEMV cannot use it: that kernel shares an activation slice across N_R0 = 4 rows,
+// and at M=4 the table costs 4096 MACs to save 32.
+//
+// Hence the different shape here. A threadgroup owns LUT_ROWS*256 rows and sweeps the input,
+// so the table is amortised over thousands of rows rather than four. The cost is that lanes
+// must now walk ROWS within a unit instead of UNITS within a row, which trades coalesced
+// reads for 256 concurrent strided streams -- and this kernel is bandwidth-bound, so that
+// trade is the whole question. Measured, not assumed.
+// ---------------------------------------------------------------------------------------
+#define NEURON_V4_LUT_TG   256                   /* threads per threadgroup               */
+#ifndef NEURON_V4_LUT_ROWS
+#define NEURON_V4_LUT_ROWS 8                     /* rows each thread accumulates          */
+#endif
+
+[[host_name("kernel_mul_mv_neuron_v4_lut_f32")]]
+kernel void kernel_mul_mv_neuron_v4_lut_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_index_in_threadgroup]]) {
+    const int K   = NEURON_VQ4_K;                       // 256
+    const int R   = NEURON_V4_LUT_ROWS;
+    const int nb  = args.ne00 / QK_NEURON;
+    const int UPT = 2;                                  // units per tile (double buffer)
+    const int upb = QK_NEURON / 16;                     // 8 units per block
+
+    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;
+    const int first_row = r0 * (R * NEURON_V4_LUT_TG);
+
+    // T holds UPT units at once: 2 * 8 pairs * 256 codewords. Two units per barrier instead
+    // of one halves the synchronisation, which the first draft spent ~128 of per row sweep
+    // against the ordinary kernel's one.
+    threadgroup float * T = (threadgroup float *) shmem;
+
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * yy = (device const float *) (src1 + offset1);
+
+    // Row pointers and the live-row mask are loop invariants: hoist them out of the unit loop
+    // rather than recomputing pointer arithmetic and a bounds branch per row per unit.
+    device const block_neuron_v4 * xrow[NEURON_V4_LUT_ROWS];
+    bool  live[NEURON_V4_LUT_ROWS];
+    FOR_UNROLL (short rr = 0; rr < R; ++rr) {
+        const int row = first_row + rr*NEURON_V4_LUT_TG + tpitg;
+        live[rr]  = row < args.ne0;
+        xrow[rr]  = (device const block_neuron_v4 *)
+                    (src0 + offset0 + (uint64_t) (live[rr] ? row : 0) * args.nb01);
+    }
+
+    float sumf[NEURON_V4_LUT_ROWS] = {0.0f};
+
+    for (int ib = 0; ib < nb; ++ib) {
+        // d and the four sub-block bytes are per BLOCK, not per unit. The draft re-read them
+        // eight times per block; read once and keep the eight scales in registers.
+        float dsc[NEURON_V4_LUT_ROWS][8];
+        FOR_UNROLL (short rr = 0; rr < R; ++rr) {
+            const float d = (float) xrow[rr][ib].d;
+            device const ushort * sbw = (device const ushort *) xrow[rr][ib].sb;
+            const uint sv = (uint) sbw[0] | ((uint) sbw[1] << 16);
+            FOR_UNROLL (short u = 0; u < 8; ++u) {
+                dsc[rr][u] = d * NEURON_VQ4_SBT[(sv >> (u*4)) & 0xF];
+            }
+        }
+
+        for (int u0 = 0; u0 < upb; u0 += UPT) {
+            // ---- build T for UPT units, one barrier for both ---------------------------
+            {
+                const int v = tpitg;
+                const float2 cv = float2(kNeuronVQ4[2*v], kNeuronVQ4[2*v + 1]);
+                FOR_UNROLL (short uu = 0; uu < UPT; ++uu) {
+                    device const float4 * y4 =
+                        (device const float4 *) (yy + ib*QK_NEURON + (u0 + uu)*16);
+                    FOR_UNROLL (short q = 0; q < 4; ++q) {
+                        const float4 yv = y4[q];
+                        T[(uu*8 + 2*q + 0)*K + v] = cv.x*yv.x + cv.y*yv.y;
+                        T[(uu*8 + 2*q + 1)*K + v] = cv.x*yv.z + cv.y*yv.w;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ---- consume: one lookup + one add per PAIR, no branch in the inner loop -----
+            FOR_UNROLL (short rr = 0; rr < R; ++rr) {
+                FOR_UNROLL (short uu = 0; uu < UPT; ++uu) {
+                    // eight codes = eight bytes = one uint2 load, not eight shifts of ushorts
+                    device const uint2 * qw =
+                        (device const uint2 *) (xrow[rr][ib].qs + (u0 + uu) * 8);
+                    const uint2 w = qw[0];
+                    float acc = 0.0f;
+                    FOR_UNROLL (short t = 0; t < 4; ++t) {
+                        acc += T[(uu*8 + t)*K + ((w.x >> (t*8)) & 0xFF)];
+                    }
+                    FOR_UNROLL (short t = 0; t < 4; ++t) {
+                        acc += T[(uu*8 + 4 + t)*K + ((w.y >> (t*8)) & 0xFF)];
+                    }
+                    sumf[rr] = fma(dsc[rr][u0 + uu], acc, sumf[rr]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst
+        + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    FOR_UNROLL (short rr = 0; rr < R; ++rr) {
+        if (live[rr]) {
+            dst_f32[first_row + rr*NEURON_V4_LUT_TG + tpitg] = sumf[rr];
+        }
+    }
+}

@@ -840,6 +840,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const char * suffix = "";
 
     bool split = false;
+    bool use_lut = false;
 
     // use custom matrix x vector kernel
     switch (tsrc0) {
@@ -967,9 +968,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_NEURON_V4:
             {
+#ifdef GGML_NEURON_V4_LUT
+                // 256 threads, R*256 rows per threadgroup: the table must be amortised over
+                // thousands of rows, not the four the ordinary kernel shares an activation over.
+                nsg  = 8;
+                nr0  = NEURON_V4_LUT_ROWS * 32;     // nr0*nsg = R*256 rows per threadgroup
+                smem = NEURON_V4_LUT_SMEM;
+                use_lut = true;
+#else
                 nsg = N_SG_NEURON_V;
                 nr0 = N_R0_NEURON_V4;
                 smem = NEURON_V4_SMEM;
+#endif
             } break;
         case GGML_TYPE_NEURON_V5:
             {
@@ -1103,7 +1113,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    if (use_lut) {
+        snprintf(base, 256, "kernel_mul_mv_neuron_v4_lut_f32");
+    } else {
+        snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    }
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1314,6 +1328,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             } break;
         case GGML_TYPE_NEURON_V4:
             {
+                // mul_mv_id has no LUT variant -- the experiment is the plain GEMV only.
                 nsg = N_SG_NEURON_V;
                 nr0 = N_R0_NEURON_V4;
                 smem = NEURON_V4_SMEM;
