@@ -1989,6 +1989,13 @@ template [[host_name("kernel_flash_attn_ext_vec_neuron_v6_neuron_v4_dk128_dv128"
 template [[host_name("kernel_flash_attn_ext_vec_neuron_v6_neuron_v5_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_neuron_v6, 32, dequantize_neuron_v6_t4, block_neuron_v5, 32, dequantize_neuron_v5_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_neuron_v6_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_neuron_v6, 32, dequantize_neuron_v6_t4, block_neuron_v6, 32, dequantize_neuron_v6_t4, 128, 128, 1>;
 
+// neuron_v keys with q4_0 values: a codebook read on one side of the attention only. With a table
+// lookup in both the key and the value read, generation at 4k tokens ran 13% slower on an M4 than with
+// either alone, and the values gain nothing from the codebook.
+template [[host_name("kernel_flash_attn_ext_vec_neuron_v4_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_neuron_v4, 32, dequantize_neuron_v4_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_neuron_v5_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_neuron_v5, 32, dequantize_neuron_v5_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_neuron_v6_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_neuron_v6, 32, dequantize_neuron_v6_t4, block_q4_0, 8, dequantize_q4_0_t4, 128, 128, 1>;
+
 template [[host_name("kernel_flash_attn_ext_vec_f32_dk192_dv192")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk192_dv192")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk192_dv192_q1_ne4")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  192, 192, 4, 1>;

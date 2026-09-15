@@ -515,6 +515,15 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s.rfind("neuron_m", 0) == 0 && s.size() == 9 && s[8] >= '1' && s[8] <= '8') {
         return (ggml_type) (GGML_TYPE_NEURON_M1 + (s[8] - '1'));
     }
+    if (s == "neuron_v4") {
+        return GGML_TYPE_NEURON_V4;
+    }
+    if (s == "neuron_v5") {
+        return GGML_TYPE_NEURON_V5;
+    }
+    if (s == "neuron_v6") {
+        return GGML_TYPE_NEURON_V6;
+    }
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }

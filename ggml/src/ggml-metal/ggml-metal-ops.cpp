@@ -1252,7 +1252,9 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_set_rows(lib, op);
+    const bool nv = ggml_metal_type_is_neuron_v(op->type);
+
+    auto pipeline = nv ? ggml_metal_library_get_pipeline_set_rows_nv(lib, op, false) : ggml_metal_library_get_pipeline_set_rows(lib, op);
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
 
@@ -1297,8 +1299,27 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    if (ggml_metal_type_is_neuron_v(op->type)) {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_device_get_neuron_nn_grid(ctx->dev, op->type, &args.lut_r, &args.lut_g), 4);
+    if (nv) {
+        // first pass: d and the sub-block multipliers of every block
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+
+        // the second pass reads what the first wrote
+        ggml_metal_op_concurrency_reset(ctx);
+
+        const ggml_metal_buffer_id grid = ggml_metal_device_get_neuron_nn_grid(ctx->dev, op->type, &args.lut_r, &args.lut_g);
+
+        ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_set_rows_nv(lib, op, true));
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, grid, 4);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+
+        const int64_t ngrp = (int64_t) ne01*nk0*(QK_NEURON/8);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((ngrp + 31)/32), ne02, ne03, 32, 1, 1);
+
+        return 1;
     }
 
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2926,8 +2947,8 @@ static bool ggml_metal_op_flash_attn_ext_vec_direct(const ggml_tensor * op) {
 
     return ggml_metal_op_flash_attn_ext_use_vec(op) &&
            op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128 &&
-           (tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0 || ggml_metal_type_is_neuron_v(tk)) &&
-           ggml_metal_type_is_neuron_v(tv);
+           (((tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0 || ggml_metal_type_is_neuron_v(tk)) && ggml_metal_type_is_neuron_v(tv)) ||
+            (ggml_metal_type_is_neuron_v(tk) && tv == GGML_TYPE_Q4_0));
 }
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
@@ -2941,8 +2962,9 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     // Falling through there asks for kernel_flash_attn_ext_neuron_mN_dk*_dv*, which does
     // not exist, and the pipeline resolves nil.
     // K and V of different types have no direct kernel either, except at decode: the vec
-    // kernels read neuron_v values (and neuron_v, q8_0 or f16 keys) in place. Dequantizing the
-    // whole cache there, once per token, is what made generation 10x slower than f16.
+    // kernels read neuron_v values (and neuron_v, q8_0 or f16 keys) in place, and q4_0 values
+    // under neuron_v keys. Dequantizing the whole cache there, once per token, is what made
+    // generation 10x slower than f16.
     if (ggml_metal_op_flash_attn_ext_vec_direct(op)) {
         return false;
     }
