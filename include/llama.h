@@ -169,6 +169,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NEURON_V4      = 51, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NEURON_V6      = 52, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NEURON_D4 = 53, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_NEURON_L4 = 54, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -463,7 +464,7 @@ extern "C" {
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
         bool neuron_fit_codebook;                                   // NEURON_V*: fit the codebook on this model's own weights
         uint32_t neuron_fit_seed;                                   // k-means seed; the fit is non-convex, so this matters
-        float neuron_fit_alpha;                                     // magnitude weighting |p|^-alpha in the centroid update
+        float neuron_fit_alpha;                                     // magnitude weighting |p|^-alpha in the centroid update; NAN = per type (v* 1.5, l4 2.5)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

@@ -459,7 +459,12 @@ extern "C" {
         // so decode gives up the constant-address lookup that v4 enjoys. It buys quality at
         // a fixed size, and pays for it at both ends.
         GGML_TYPE_NEURON_D4 = 54,
-        GGML_TYPE_COUNT   = 55,
+        // Lattice: v4's 70-byte block, but each code byte holds two 4-bit level indices, one per
+        // value. A weight is d * sub-block multiplier * L[n], with L a 16-level table per model.
+        // Codes are numbers, not codeword indices, so kernels multiply by them instead of
+        // reading a 256-entry table, and input gradients are running sums instead of scatters.
+        GGML_TYPE_NEURON_L4 = 55,
+        GGML_TYPE_COUNT   = 56,
     };
 
     // [TAG_GGML_PREC]
@@ -516,6 +521,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_NEURON_V4 = 29, // except 1d tensors; v4 codebook, 4.375 bpw
+        GGML_FTYPE_MOSTLY_NEURON_L4 = 30, // except 1d tensors; lattice levels, 4.375 bpw
     };
 
     // available tensor operations:
@@ -2983,6 +2989,14 @@ extern "C" {
     GGML_API void          ggml_neuron_d4_set_codebook(const float * tbl);
     GGML_API const float * ggml_neuron_d4_get_codebook(void);
     GGML_API int           ggml_neuron_d4_codebook_len(void);  // K * dim, in floats
+
+    #define GGML_NEURON_L4_LEVELS 16
+    // neuron_l4 levels: 16 ascending values with L[15-i] = -L[i]. Bound from the model file
+    // ("neuron.l4.levels") or fitted at quantize time. NULL restores the shipped table.
+    GGML_API void          ggml_neuron_l4_set_levels(const float * lv);
+    GGML_API const float * ggml_neuron_l4_get_levels(void);
+    GGML_API bool          ggml_neuron_l4_levels_is_custom(void);
+    GGML_API uint64_t      ggml_neuron_l4_levels_hash(void);
 
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(

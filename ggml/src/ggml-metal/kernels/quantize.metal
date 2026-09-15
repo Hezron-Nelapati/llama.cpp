@@ -235,6 +235,135 @@ NEURON_V_CPY(4)
 NEURON_V_CPY(5)
 NEURON_V_CPY(6)
 
+// neuron_l4 weight encoding: the CPU search, refit included, with 32 lanes sharing a block.
+// Nearest level for t = |x|/g is a count of boundaries below t and its reconstruction is the
+// same count as steps, so a lane does no table read. kNeuronL4 is a source constant, so the
+// boundaries and steps fold at compile time.
+static inline float neuron_l4_rec_gpu(float t, thread int & n) {
+    float r = kNeuronL4[8];
+    n = 0;
+    for (int k = 0; k < 7; ++k) {
+        const int above = t > 0.5f*(kNeuronL4[8 + k] + kNeuronL4[9 + k]) ? 1 : 0;
+        r += (float) above * (kNeuronL4[9 + k] - kNeuronL4[8 + k]);
+        n += above;
+    }
+    return r;
+}
+
+#define NEURON_L4_CPY_PASS                                                                \
+    for (int u = tiisg; u < NSB*16; u += 32) {                                            \
+        threadgroup float * a = sa + (u / 16) * SBV;                                      \
+        const float  g  = d * kNeuronVQSB[u % 16];                                        \
+        float e2 = INFINITY;                                                              \
+        if (g > 0.0f) {                                                                   \
+            const float inv = 1.0f / g;                                                   \
+            e2 = 0.0f;                                                                    \
+            for (int v = 0; v < SBV; ++v) {                                               \
+                int n = 0;                                                                \
+                const float e = a[v] - g * neuron_l4_rec_gpu(a[v] * inv, n);              \
+                e2 += e * e;                                                              \
+            }                                                                             \
+        }                                                                                 \
+        sse[u] = e2;                                                                      \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+    if (tiisg < NSB) {                                                                    \
+        int   mj = 0;                                                                     \
+        float mb = INFINITY;                                                              \
+        for (int j = 0; j < 16; ++j) {                                                    \
+            if (sse[tiisg*16 + j] < mb) { mb = sse[tiisg*16 + j]; mj = j; }               \
+        }                                                                                 \
+        smj[tiisg] = (uchar) mj;                                                          \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+    for (int v = tiisg; v < NB; v += 32) {                                                \
+        const float g = d * kNeuronVQSB[smj[v / SBV]];                                    \
+        int n = 0;                                                                        \
+        if (g > 0.0f) { neuron_l4_rec_gpu(sa[v] / g, n); }                                \
+        idx[v] = (uchar) n;                                                               \
+    }                                                                                     \
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#define NEURON_L4_CPY_REFIT                                                               \
+    {                                                                                     \
+        float num = 0.0f, den = 0.0f;                                                     \
+        for (int v = tiisg; v < NB; v += 32) {                                            \
+            const float r = kNeuronVQSB[smj[v / SBV]] * kNeuronL4[8 + idx[v]];            \
+            num += sa[v] * r;                                                             \
+            den += r * r;                                                                 \
+        }                                                                                 \
+        num = simd_sum(num);                                                              \
+        den = simd_sum(den);                                                              \
+        if (den > 0.0f && num > 0.0f) {                                                   \
+            const float dn = (float) (half) (num / den);                                  \
+            if (dn > 0.0f) { d = dn; }                                                    \
+        }                                                                                 \
+    }
+
+kernel void kernel_cpy_f32_neuron_l4(
+        constant ggml_metal_kargs_cpy & args,
+        device const char * src0,
+        device       char * dst,
+        threadgroup char  * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_threadgroup]]) {
+    const int NB  = QK_NEURON;
+    const int SBV = NEURON_VQ_SBV;
+    const int NSB = NEURON_VQ_NSB;
+
+    threadgroup float * sa  = (threadgroup float *) shmem;
+    threadgroup float * sse = (threadgroup float *) (shmem + NB*4);
+    threadgroup uchar * idx = (threadgroup uchar *) (shmem + NB*8);
+    threadgroup uchar * smj = (threadgroup uchar *) (shmem + NB*9);
+
+    const int64_t ib  = tgpig.x;
+    const int64_t i01 = tgpig.y;
+    const int64_t i02 = tgpig.z % args.ne02;
+    const int64_t i03 = tgpig.z / args.ne02;
+    if (ib >= args.nk0 || i01 >= args.ne01) { return; }
+
+    device const float * src = (device const float *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01) + ib*QK_NEURON;
+    device block_neuron_l4 * pd = (device block_neuron_l4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1) + ib;
+
+    float a = 0.0f;
+    for (int j = tiisg; j < NB; j += 32) {
+        const float v = fabs(src[j]);
+        sa[j] = v;
+        a = max(a, v);
+    }
+    a = simd_max(a);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (a == 0.0f) {
+        if (tiisg == 0) {
+            pd->d = (half) 0.0f;
+            for (int i = 0; i < 4;    ++i) { pd->sb[i] = 0; }
+            for (int i = 0; i < NB/2; ++i) { pd->qs[i] = 0; }
+        }
+        return;
+    }
+    float d = (float) (half) a;
+
+    NEURON_L4_CPY_PASS
+    NEURON_L4_CPY_REFIT
+    NEURON_L4_CPY_PASS
+    NEURON_L4_CPY_REFIT
+    NEURON_L4_CPY_PASS
+
+    if (tiisg == 0) {
+        pd->d = (half) d;
+        for (int i = 0; i < 4;    ++i) { pd->sb[i] = 0; }
+        for (int i = 0; i < NB/2; ++i) { pd->qs[i] = 0; }
+        for (int s = 0; s < NSB; ++s) {
+            pd->sb[s >> 1] |= (uint8_t) (smj[s] << ((s & 1) * 4));
+        }
+        for (int v = 0; v < NB; ++v) {
+            const int n = src[v] < 0.0f ? 7 - idx[v] : 8 + idx[v];
+            pd->qs[v >> 1] |= (uint8_t) (n << ((v & 1) * 4));
+        }
+    }
+}
+
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
         constant ggml_metal_kargs_cpy & args,
@@ -469,6 +598,7 @@ template [[host_name("kernel_get_rows_neuron_m5")]] kernel get_rows_q_t kernel_g
 template [[host_name("kernel_get_rows_neuron_v4")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v4, QK_NEURON/16, dequantize_neuron_v4>;
 template [[host_name("kernel_get_rows_neuron_v6")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v6, QK_NEURON/16, dequantize_neuron_v6>;
 template [[host_name("kernel_get_rows_neuron_v5")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_v5, QK_NEURON/16, dequantize_neuron_v5>;
+template [[host_name("kernel_get_rows_neuron_l4")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_l4, QK_NEURON/16, dequantize_neuron_l4>;
 template [[host_name("kernel_get_rows_neuron_m6")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m6, QK_NEURON/16, dequantize_neuron_m6>;
 template [[host_name("kernel_get_rows_neuron_m7")]] kernel get_rows_q_t kernel_get_rows_q<block_neuron_m7, QK_NEURON/16, dequantize_neuron_m7>;
 template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0>;

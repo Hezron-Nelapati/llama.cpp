@@ -1143,3 +1143,18 @@ void dequantize_neuron_v##SFX##_t4(device const block_neuron_v##SFX *xb, short i
 NEURON_V_DEQ_T4(4)
 NEURON_V_DEQ_T4(5)
 NEURON_V_DEQ_T4(6)
+
+// neuron_l4. `il` is a 16-value slice = one sub-block, so one multiplier serves the call.
+// The 8 code bytes are read as 2 ushort-pairs of nibbles: 4 ushort loads for 16 levels.
+template <typename type4x4>
+void dequantize_neuron_l4(device const block_neuron_l4 *xb, short il, thread type4x4 & reg) {
+    const float d = (float) xb->d * kNeuronVQSB[(xb->sb[il >> 1] >> ((il & 1) * 4)) & 15];
+    device const ushort * qw = (device const ushort *) (xb->qs + il * 8);
+    FOR_UNROLL (short s = 0; s < 4; ++s) {
+        const uint w = qw[s];
+        reg[s][0] = d * kNeuronL4[ w        & 15];
+        reg[s][1] = d * kNeuronL4[(w >>  4) & 15];
+        reg[s][2] = d * kNeuronL4[(w >>  8) & 15];
+        reg[s][3] = d * kNeuronL4[(w >> 12) & 15];
+    }
+}

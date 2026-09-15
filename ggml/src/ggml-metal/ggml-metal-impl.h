@@ -97,6 +97,9 @@
 // against v5's ~132 -- the divergent constant-read cost the polar work priced at -45%.
 // 16 KB is heavy for residency, but evidently cheaper than not staging.
 #define NEURON_V6_SMEM  (16384 + 64)            /* 4096 half2 + 16 sub-block multipliers */
+// neuron_l4 stages 16 levels next to the 16 multipliers: 128 bytes, no codebook.
+#define N_R0_NEURON_L4  8
+#define NEURON_L4_SMEM  (64 + 64)
 
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2

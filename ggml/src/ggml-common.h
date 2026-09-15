@@ -392,6 +392,19 @@ NEURON_V_BLOCK(4)
 NEURON_V_BLOCK(5)
 NEURON_V_BLOCK(6)
 
+// neuron_l4 -- lattice. Same 70 bytes as v4: fp16 d, 4-bit multiplier per 16 values, and
+// 64 code bytes. Each code byte is two 4-bit level indices, one per value:
+//   n = (qs[v >> 1] >> ((v & 1) * 4)) & 15      w = d * kNeuronVQSB[m] * kNeuronL4[n]
+// Kernels multiply by the level instead of reading a codeword, so no per-pair table exists.
+#define NEURON_L4_NL   16
+typedef struct {
+    ggml_half d;
+    uint8_t   sb[NEURON_VQ_SBBY(4)];
+    uint8_t   qs[QK_NEURON / 2];
+} block_neuron_l4;
+static_assert(sizeof(block_neuron_l4) == sizeof(ggml_half) + NEURON_VQ_SBBY(4) + QK_NEURON / 2,
+              "wrong block_neuron_l4 size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -723,6 +736,14 @@ GGML_TABLE_END()
 // relative error of the grid: 1.62%. See experiments/fit_subscale.py.
 GGML_TABLE_BEGIN(float, kNeuronVQSB, 16)
     +1.0000000f, +0.9686971f, +0.9174675f, +0.8703421f, +0.8274198f, +0.7865809f, +0.7469853f, +0.7069893f, +0.6659136f, +0.6228875f, +0.5759767f, +0.5239401f, +0.4643680f, +0.3922645f, +0.2931716f, +0.1260537f,
+GGML_TABLE_END()
+
+// neuron_l4 levels, ascending, L[15-i] = -L[i], top at 1. llama_neuron_fit_l4_levels on Qwen3-0.6B:
+// 12 rounds from the uniform grid, |x/g|^-2.5 weights. A model carries its own in "neuron.l4.levels".
+// Held-out perplexity (60 x 512): f16 12.87, v4 13.98, this 13.95; alpha 1 to its fixed point 14.13,
+// alpha 2.5 to its fixed point 14.10.
+GGML_TABLE_BEGIN(float, kNeuronL4, 16)
+    -1.0000000f, -0.7949443f, -0.6251937f, -0.4671594f, -0.3161376f, -0.1844370f, -0.0872916f, -0.0303227f, +0.0303227f, +0.0872916f, +0.1844370f, +0.3161376f, +0.4671594f, +0.6251937f, +0.7949443f, +1.0000000f,
 GGML_TABLE_END()
 
 // The neuron_v6 codebook: 4096 points in the pair plane, same fit as kNeuronVQ4/5 --

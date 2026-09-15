@@ -805,6 +805,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_neuron_v6,
         .from_float_ref           = (ggml_from_float_t) quantize_row_neuron_v6_ref,
     },
+    [GGML_TYPE_NEURON_L4] = {
+        .type_name                = "neuron_l4",
+        .blck_size                = QK_NEURON,
+        .type_size                = sizeof(block_neuron_l4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_neuron_l4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_neuron_l4_ref,
+    },
     [GGML_TYPE_NEURON_D4] = {
         .type_name                = "neuron_d4",
         .blck_size                = QK_NEURON,
@@ -1532,6 +1540,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
         case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
         case GGML_FTYPE_MOSTLY_NEURON_V4:     wtype = GGML_TYPE_NEURON_V4; break;
+        case GGML_FTYPE_MOSTLY_NEURON_L4:     wtype = GGML_TYPE_NEURON_L4; break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -8153,6 +8162,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_NEURON_V4: result = quantize_neuron_v4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NEURON_V6: result = quantize_neuron_v6(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NEURON_D4: result = quantize_neuron_d4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_NEURON_L4: result = quantize_neuron_l4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NEURON_V5: result = quantize_neuron_v5(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NEURON_M1: result = quantize_neuron_m1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NEURON_M2: result = quantize_neuron_m2(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

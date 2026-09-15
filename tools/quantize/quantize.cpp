@@ -71,6 +71,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NEURON_M7", LLAMA_FTYPE_MOSTLY_NEURON_M7, "7.59 bpw, neuron pair codec", },
     { "NEURON_M8", LLAMA_FTYPE_MOSTLY_NEURON_M8, "8.59 bpw, neuron pair codec", },
     { "NEURON_V4", LLAMA_FTYPE_MOSTLY_NEURON_V4, "4.375 bpw, neuron d=2 VQ codec", },
+    { "NEURON_L4", LLAMA_FTYPE_MOSTLY_NEURON_L4, "4.375 bpw, neuron lattice: 4-bit level per value, fitted levels", },
     { "NEURON_V6", LLAMA_FTYPE_MOSTLY_NEURON_V6, "6.5 bpw, neuron d=2 VQ codec", },
     { "NEURON_D4", LLAMA_FTYPE_MOSTLY_NEURON_D4, "4.375 bpw, neuron d=4 VQ -- v4's size, 1 MiB codebook, high compute", },
     { "NEURON_V5", LLAMA_FTYPE_MOSTLY_NEURON_V5, "5.125 bpw, neuron d=2 VQ codec", },
@@ -183,9 +184,9 @@ static void usage(const char * executable) {
     printf("                                      override model metadata by key in the quantized model. may be specified multiple times.\n");
     printf("                                      WARNING: this is an advanced option, use with care.\n");
     printf("  --neuron-fit [--neuron-fit-seed N] [--neuron-fit-alpha A]\n");
-    printf("                                      NEURON_V*: fit the codebook on this model's own weights\n");
+    printf("                                      NEURON_V*: fit the codebook (NEURON_L4: the 16 levels) on this model's own weights\n");
     printf("                                      during the quantise, and carry it in the output. The fit is\n");
-    printf("                                      non-convex, so the seed is part of the result (default 0, alpha 1.5)\n");
+    printf("                                      non-convex, so the seed is part of the result (default 0, alpha 1.5; NEURON_L4 always fits, alpha 2.5)\n");
     printf("  --neuron-codebook FNAME\n");
     printf("                                      NEURON_V*: encode against a table from experiments/fit_vq.py\n");
     printf("  --dry-run\n");

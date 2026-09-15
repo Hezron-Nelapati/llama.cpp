@@ -3693,6 +3693,72 @@ NEURON_V_MV_IMPL(4, 1)
 NEURON_V_MV_IMPL(5, 1)
 NEURON_V_MV_IMPL(6, 1)
 
+// neuron_l4 GEMV. A code is a level index, not a codeword: per value one load from 16 levels
+// staged in threadgroup memory, then a dot per 4 values. Same lanes, rows and activation hoist
+// as the v* GEMV; the 8 code bytes of a unit are 4 ushort loads holding 16 nibbles.
+void kernel_mul_mv_neuron_l4_f32_impl(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1,
+        device char * dst, threadgroup char * shmem,
+        uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    const int nb = args.ne00 / QK_NEURON;
+    const int r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * N_R0_NEURON_L4;
+    threadgroup float * slv = (threadgroup float *) shmem;
+    threadgroup float * ssb = (threadgroup float *) (shmem + 64);
+    for (int v = 32*sgitg + tiisg; v < 16; v += 32*NSG) {
+        slv[v] = kNeuronL4[v];
+        ssb[v] = kNeuronVQSB[v];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint i12 = im % FC_mul_mv_ne12, i13 = im / FC_mul_mv_ne12;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+    device const block_neuron_l4 * x = (device const block_neuron_l4 *) (src0 + offset0);
+    device const float * yy = (device const float *) (src1 + offset1);
+    float sumf[N_R0_NEURON_L4] = {0.0f};
+    const int upb = QK_NEURON / 16;
+    const int nu  = nb * upb;
+    for (int uu = tiisg; uu < nu; uu += 32) {
+        const int ib = uu / upb;
+        const int u  = uu - ib * upb;
+        float4 yv[4];
+        {
+            device const float4 * y4 = (device const float4 *) (yy + ib*QK_NEURON + u*16);
+            FOR_UNROLL (short q = 0; q < 4; ++q) { yv[q] = y4[q]; }
+        }
+        FOR_UNROLL (short row = 0; row < N_R0_NEURON_L4; ++row) {
+            device const block_neuron_l4 * xr = (device const block_neuron_l4 *) ((device const char *) x + row*args.nb01);
+            const float d = (float) xr[ib].d * ssb[(xr[ib].sb[u >> 1] >> ((u & 1) * 4)) & 15];
+            device const ushort * qw = (device const ushort *) (xr[ib].qs + u * 8);
+            float acc = 0.0f;
+            FOR_UNROLL (short q = 0; q < 4; ++q) {
+                const uint w = qw[q];
+                const float4 lv = float4(slv[w & 15], slv[(w >> 4) & 15], slv[(w >> 8) & 15], slv[(w >> 12) & 15]);
+                acc += dot(lv, yv[q]);
+            }
+            sumf[row] = fma(d, acc, sumf[row]);
+        }
+    }
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    for (short row = 0; row < N_R0_NEURON_L4 && first_row + row < args.ne0; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) { dst_f32[first_row + row] = tot; }
+    }
+}
+
+[[host_name("kernel_mul_mv_neuron_l4_f32")]]
+kernel void kernel_mul_mv_neuron_l4_f32(
+        constant ggml_metal_kargs_mul_mv & args, device const char * src0,
+        device const char * src1, device char * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_neuron_l4_f32_impl(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // ---------------------------------------------------------------------------------------
 // LUT-GEMV for neuron_v4 (T-MAC / LUT-GEMM family).
 //

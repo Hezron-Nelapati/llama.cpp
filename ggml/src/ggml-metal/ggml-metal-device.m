@@ -183,11 +183,33 @@ struct ggml_metal_library {
 // constant-address arrays, which is the free tier of the lookup cost hierarchy -- passing the
 // table as a buffer instead would cost the prompt path 45%. Rewriting the source keeps every
 // lookup exactly as it was and needs no kernel change at all.
+// Every table the kernels take from source: v* codebooks and neuron_l4 levels.
+static uint64_t ggml_metal_neuron_tables_hash(void) {
+    return ggml_neuron_vq_codebook_hash() ^ ggml_neuron_l4_levels_hash();
+}
+
 static NSString * ggml_metal_source_apply_codebook(NSString * src) {
-    if (!ggml_neuron_vq_codebook_is_custom(GGML_TYPE_COUNT)) {
+    if (!ggml_neuron_vq_codebook_is_custom(GGML_TYPE_COUNT) && !ggml_neuron_l4_levels_is_custom()) {
         return src;
     }
     NSMutableString * out = [src mutableCopy];
+    if (ggml_neuron_l4_levels_is_custom()) {
+        const float * lv = ggml_neuron_l4_get_levels();
+        const NSRange rh = [out rangeOfString:@"GGML_TABLE_BEGIN(float, kNeuronL4, 16)"];
+        if (rh.location != NSNotFound) {
+            const NSRange rest = NSMakeRange(NSMaxRange(rh), out.length - NSMaxRange(rh));
+            const NSRange rt   = [out rangeOfString:@"GGML_TABLE_END()" options:0 range:rest];
+            if (rt.location != NSNotFound) {
+                NSMutableString * body = [NSMutableString stringWithCapacity:16*20];
+                [body appendString:@"\n"];
+                for (int i = 0; i < 16; ++i) {
+                    [body appendFormat:@"%+.9ef,%s", lv[i], (i % 8 == 7) ? "\n" : " "];
+                }
+                [out replaceCharactersInRange:NSMakeRange(NSMaxRange(rh), rt.location - NSMaxRange(rh)) withString:body];
+                GGML_LOG_DEBUG("%s: kNeuronL4 <- the model's own levels\n", __func__);
+            }
+        }
+    }
     const enum ggml_type types[3] = { GGML_TYPE_NEURON_V4, GGML_TYPE_NEURON_V5, GGML_TYPE_NEURON_V6 };
     const int            sfx  [3] = { 4, 5, 6 };
     for (int i = 0; i < 3; ++i) {
@@ -371,7 +393,7 @@ static bool ggml_metal_library_compile_all(
         res->src_provider = Block_copy(source_for_kind);
         res->origin       = origin;
     }
-    res->vq_hash = ggml_neuron_vq_codebook_hash();
+    res->vq_hash = ggml_metal_neuron_tables_hash();
 
     int64_t  * t_per_lib   = calloc(GGML_METAL_LIB_COUNT, sizeof(int64_t));
     NSError ** err_per_lib = calloc(GGML_METAL_LIB_COUNT, sizeof(NSError *));
@@ -778,10 +800,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
     // any pipeline is handed out, so no kernel runs against a table the model did not encode
     // with. Deliberately NOT under lib->lock: compile_all fans out through dispatch and waits
     // on the group, and holding the lock across that wedges the load.
-    if (lib->src_provider && lib->vq_hash != ggml_neuron_vq_codebook_hash()) {
-        GGML_LOG_INFO("%s: model carries its own neuron codebook (%016llx, libraries built with "
-                      "%016llx) -- rebuilding metal libraries against it\n", __func__,
-                      (unsigned long long) ggml_neuron_vq_codebook_hash(),
+    if (lib->src_provider && lib->vq_hash != ggml_metal_neuron_tables_hash()) {
+        GGML_LOG_INFO("%s: model carries its own neuron tables (%016llx, libraries built with "
+                      "%016llx) -- rebuilding metal libraries against them\n", __func__,
+                      (unsigned long long) ggml_metal_neuron_tables_hash(),
                       (unsigned long long) lib->vq_hash);
         for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
             [lib->objs[kind] release];
@@ -2038,6 +2060,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
+            if (op->src[0]->type == GGML_TYPE_NEURON_L4) {
+                return false; // no mul_mv_id / mul_mm_id kernels for the lattice yet
+            }
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, false,
                     ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
@@ -2062,7 +2087,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_IQ4_NL:
                            case GGML_TYPE_TQ2_0:
                            case GGML_TYPE_I32:
-                           // weight encoding on the GPU, via kernel_cpy_f32_neuron_v*
+                           // weight encoding on the GPU, via kernel_cpy_f32_neuron_v* and _l4
+                           case GGML_TYPE_NEURON_L4:
                            case GGML_TYPE_NEURON_V4:
                            case GGML_TYPE_NEURON_V5:
                            case GGML_TYPE_NEURON_V6:

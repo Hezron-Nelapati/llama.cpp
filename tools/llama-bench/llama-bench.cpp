@@ -518,6 +518,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "neuron_v4") {
         return GGML_TYPE_NEURON_V4;
     }
+    if (s == "neuron_l4") {
+        return GGML_TYPE_NEURON_L4;
+    }
     if (s == "neuron_v5") {
         return GGML_TYPE_NEURON_V5;
     }

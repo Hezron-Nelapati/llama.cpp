@@ -56,6 +56,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q5_K_S:    name = LLAMA_FTYPE_PREFIX "Q5_K - Small"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:    name = LLAMA_FTYPE_PREFIX "Q5_K - Medium"; break;
         case LLAMA_FTYPE_MOSTLY_NEURON_V4: name = LLAMA_FTYPE_PREFIX "NEURON_V4 - 4.375 bpw d=2 VQ"; break;
+        case LLAMA_FTYPE_MOSTLY_NEURON_L4: name = LLAMA_FTYPE_PREFIX "NEURON_L4 - 4.375 bpw lattice"; break;
         case LLAMA_FTYPE_MOSTLY_NEURON_V6: name = LLAMA_FTYPE_PREFIX "NEURON_V6 - 6.5 bpw d=2 VQ"; break;
         case LLAMA_FTYPE_MOSTLY_NEURON_V5: name = LLAMA_FTYPE_PREFIX "NEURON_V5 - 5.125 bpw d=2 VQ"; break;
         case LLAMA_FTYPE_MOSTLY_Q6_K:      name = LLAMA_FTYPE_PREFIX "Q6_K"; break;
@@ -774,6 +775,20 @@ llama_model_loader::llama_model_loader(
                 }
                 ggml_neuron_d4_set_codebook((const float *) gguf_get_arr_data(metadata, cb));
                 ftype = LLAMA_FTYPE_MOSTLY_NEURON_D4;
+            } break;
+            case GGML_TYPE_NEURON_L4: {
+                // levels are part of the format: bind the file's table, or the shipped one if it has none
+                const int lid = gguf_find_key(metadata, "neuron.l4.levels");
+                if (lid >= 0) {
+                    if (gguf_get_arr_type(metadata, lid) != GGUF_TYPE_FLOAT32 ||
+                        gguf_get_arr_n(metadata, lid) != (size_t) GGML_NEURON_L4_LEVELS) {
+                        throw std::runtime_error(format("%s: neuron.l4.levels must be %d f32", __func__, GGML_NEURON_L4_LEVELS));
+                    }
+                    ggml_neuron_l4_set_levels((const float *) gguf_get_arr_data(metadata, lid));
+                } else {
+                    ggml_neuron_l4_set_levels(nullptr);
+                }
+                ftype = LLAMA_FTYPE_MOSTLY_NEURON_L4;
             } break;
             case GGML_TYPE_NEURON_V4:
             case GGML_TYPE_NEURON_V5:

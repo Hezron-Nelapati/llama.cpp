@@ -2221,12 +2221,17 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     // the whole ~65k-evaluation search on its own and the packing buffers sit in threadgroup
     // memory instead of spilling out of registers.
     switch (op->type) {
+        case GGML_TYPE_NEURON_L4:
         case GGML_TYPE_NEURON_V4:
         case GGML_TYPE_NEURON_V5:
         case GGML_TYPE_NEURON_V6: {
             const int nsbt = 1 << (op->type == GGML_TYPE_NEURON_V6 ? NEURON_VQ6_SBB : NEURON_VQ5_SBB);
-            const size_t smem =
-                  QK_NEURON*sizeof(float)                      // the staged block
+            const size_t smem = op->type == GGML_TYPE_NEURON_L4
+                ? QK_NEURON*sizeof(float)                      // |x| of the block
+                + NEURON_VQ_NSB*16*sizeof(float)               // sse per (sub-block, scale)
+                + QK_NEURON*sizeof(uint8_t)                    // magnitude index per value
+                + NEURON_VQ_NSB*sizeof(uint8_t)                // chosen multipliers
+                : QK_NEURON*sizeof(float)                      // the staged block
                 + NEURON_VQ_NSB*nsbt*sizeof(float)             // sse per (sub-block, scale)
                 + (QK_NEURON/2)*sizeof(uint16_t)               // chosen codes
                 + NEURON_VQ_NSB*sizeof(uint8_t);               // chosen multipliers

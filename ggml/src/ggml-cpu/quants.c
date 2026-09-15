@@ -1571,3 +1571,40 @@ void quantize_row_neuron_v##SFX(const float * GGML_RESTRICT x, void * GGML_RESTR
 NEURON_V_VEC_DOT(4)
 NEURON_V_VEC_DOT(5)
 NEURON_V_VEC_DOT(6)
+
+// neuron_l4: levels are decoded per 16-value sub-block into a local array, so the dot itself
+// runs over plain floats. One multiplier per sub-block, hoisted out of the value loop.
+void ggml_vec_dot_neuron_l4_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                const void * GGML_RESTRICT vx, size_t bx,
+                                const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    const block_neuron_l4 * GGML_RESTRICT x = vx;
+    const float * GGML_RESTRICT y = vy;
+    const float * L = ggml_neuron_l4_get_levels();
+    const int nb = n / QK_NEURON;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float * yb = y + (size_t) i * QK_NEURON;
+        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {
+            const float g = d * kNeuronVQSB[(x[i].sb[sblk >> 1] >> ((sblk & 1) * 4)) & 15];
+            const uint8_t * q = x[i].qs + sblk * (NEURON_VQ_SBV / 2);
+            float lv[NEURON_VQ_SBV];
+            for (int v = 0; v < NEURON_VQ_SBV / 2; ++v) {
+                lv[2*v]     = L[q[v] & 15];
+                lv[2*v + 1] = L[q[v] >> 4];
+            }
+            const float * ys = yb + sblk * NEURON_VQ_SBV;
+            float acc = 0.0f;
+            for (int v = 0; v < NEURON_VQ_SBV; ++v) {
+                acc += lv[v] * ys[v];
+            }
+            sum += g * acc;
+        }
+    }
+    *s = sum;
+}
+
+void quantize_row_neuron_l4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_neuron_l4_ref(x, (block_neuron_l4 *) y, k);
+}
