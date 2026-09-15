@@ -76,6 +76,9 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // release unused KV cells and re-reserve the compute buffers at the smaller size
+    bool memory_shrink();
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();
@@ -366,6 +369,9 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // memory layout the previous graph was built against
+    uint32_t gf_res_prev_layout_gen = 0;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

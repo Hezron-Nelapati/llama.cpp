@@ -28,7 +28,9 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                     uint32_t   kv_size_init = 0,
+                     uint32_t   grow_margin_mib = 0);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -46,7 +48,9 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+                     uint32_t   kv_size_init = 0,
+                     uint32_t   grow_margin_mib = 0);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -64,6 +68,10 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+
+    uint32_t get_layout_gen() const override;
+
+    bool shrink() override;
 
     void clear(bool data) override;
 

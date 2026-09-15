@@ -1691,12 +1691,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_p
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(
         ggml_metal_library_t lib,
-        const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
-
+        enum ggml_type type) {
     char base[256];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_kv_%s_f16", ggml_type_name(op->src[1]->type));
+    snprintf(base, 256, "kernel_flash_attn_ext_kv_%s_f16", ggml_type_name(type));
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
     if (!res.pipeline) {
@@ -1860,7 +1858,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t dk = (int32_t) op->src[1]->ne[0];
     const int32_t dv = (int32_t) op->src[2]->ne[0];
 
-    const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
+    char type[64];
+    if (use_kv_f16) {
+        snprintf(type, sizeof(type), "f16");
+    } else if (op->src[1]->type != op->src[2]->type) {
+        snprintf(type, sizeof(type), "%s_%s", ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type));
+    } else {
+        snprintf(type, sizeof(type), "%s", ggml_type_name(op->src[1]->type));
+    }
 
     char qne_suffix[16] = {0};
     if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {

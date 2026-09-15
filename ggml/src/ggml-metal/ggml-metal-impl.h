@@ -1088,6 +1088,8 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    float    lut_r;   // neuron_v: the nearest-codeword grid covers [-lut_r, lut_r]^2 in codebook units
+    int32_t  lut_g;   // neuron_v: grid cells per side
 } ggml_metal_kargs_set_rows;
 
 typedef struct {

@@ -100,6 +100,12 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // changes whenever the memory tensors are reallocated; a graph built before the change must not be reused
+    virtual uint32_t get_layout_gen() const { return 0; }
+
+    // release storage that is not in use; the caller synchronizes first
+    virtual bool shrink() { return false; }
+
     //
     // ops
     //

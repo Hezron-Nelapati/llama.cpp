@@ -371,7 +371,9 @@ extern "C" {
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
         uint32_t n_ctx;                 // text context, 0 = from model
-        uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
+        uint32_t n_ctx_init;            // KV cells allocated at start, grown on demand up to n_ctx (0 = n_ctx)
+        uint32_t kv_grow_margin;        // MiB of device memory that must stay free after the KV cache grows
+        uint32_t n_batch;              // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
@@ -755,6 +757,10 @@ extern "C" {
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);
+
+    // Release the KV cells above the highest one in use, down to the initial size (n_ctx_init),
+    // and the compute buffers sized for them. Returns true if anything was released
+    LLAMA_API bool llama_memory_shrink(struct llama_context * ctx);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails

@@ -2820,6 +2820,21 @@ private:
 
                 metrics_flush_idle();
 
+                if (params_base.kv_drop_idle) {
+                    bool dropped = false;
+                    for (auto & slot : slots) {
+                        if (slot.prompt.n_tokens() > 0) {
+                            slot.prompt_clear();
+                            dropped = true;
+                        }
+                    }
+
+                    if (dropped) {
+                        const bool shrunk = llama_memory_shrink(ctx_tgt) | (ctx_dft && llama_memory_shrink(ctx_dft));
+                        SRV_INF("dropped the KV of idle slots%s\n", shrunk ? ", cache shrunk" : "");
+                    }
+                }
+
                 return; // skip further processing
 
             } else {

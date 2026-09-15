@@ -996,6 +996,11 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // nearest-codeword grids for neuron_v4, v5, v6
+    NSLock *       nn_grid_lock;
+    id<MTLBuffer>  nn_grid[3];
+    float          nn_grid_r[3];
 };
 
 //
@@ -1190,6 +1195,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
     assert(dev != NULL);
+
+    dev->nn_grid_lock = [[NSLock alloc] init];
 
     @autoreleasepool {
         if (dev->mtl_device == nil) {
@@ -1449,10 +1456,88 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
     return dev;
 }
 
+// Exact nearest codeword to (qx, qy) in a radius-sorted table: binary search to the query's radius,
+// walk outward on both sides, stop where |len(c) - len(q)| exceeds the best distance. The same
+// search the GPU weight encoder runs; here it fills a grid once.
+static int ggml_metal_neuron_nn(const float * tbl, int K, float qx, float qy) {
+    const float qn = qx*qx + qy*qy;
+    const float qr = sqrt(qn);
+    int lo = 0, hi = K - 1;
+    while (lo < hi) {
+        const int m = (lo + hi) >> 1;
+        if (tbl[2*m]*tbl[2*m] + tbl[2*m + 1]*tbl[2*m + 1] < qn) { lo = m + 1; } else { hi = m; }
+    }
+    int   bc = lo < K ? lo : K - 1;
+    float bd = INFINITY, lim_hi = INFINITY, lim_lo = 0.0f;
+    for (int c = lo; c < K; ++c) {
+        const float cx = tbl[2*c], cy = tbl[2*c + 1];
+        if (cx*cx + cy*cy > lim_hi) { break; }
+        const float d = (qx - cx)*(qx - cx) + (qy - cy)*(qy - cy);
+        if (d < bd) { bd = d; bc = c; const float s = sqrt(bd), u = qr + s, l = qr - s; lim_hi = u*u; lim_lo = l > 0.0f ? l*l : 0.0f; }
+    }
+    for (int c = lo - 1; c >= 0; --c) {
+        const float cx = tbl[2*c], cy = tbl[2*c + 1];
+        if (cx*cx + cy*cy < lim_lo) { break; }
+        const float d = (qx - cx)*(qx - cx) + (qy - cy)*(qy - cy);
+        if (d < bd) { bd = d; bc = c; const float s = sqrt(bd), l = qr - s; lim_lo = l > 0.0f ? l*l : 0.0f; }
+    }
+    return bc;
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_get_neuron_nn_grid(ggml_metal_device_t dev, enum ggml_type type, float * r, int * g) {
+    // 1024 cells per side: 27 cells per codeword spacing at v5, 14 at v6, so only queries within a
+    // few hundredths of a spacing from a Voronoi edge can take the neighbouring codeword
+    const int G = 1024;
+    const int i = type == GGML_TYPE_NEURON_V4 ? 0 : type == GGML_TYPE_NEURON_V5 ? 1 : 2;
+
+    [dev->nn_grid_lock lock];
+    if (dev->nn_grid[i] == nil) {
+        const float * tbl = ggml_neuron_vq_get_codebook(type);
+        const int     K   = ggml_neuron_vq_codebook_size(type);
+
+        // the grid is the square around the codebook's disk: pairs past its outer ring are moved
+        // onto that ring along their own ray, where the nearest codeword does not change
+        float R = 0.0f;
+        for (int c = 0; c < K; ++c) {
+            R = MAX(R, sqrt(tbl[2*c]*tbl[2*c] + tbl[2*c + 1]*tbl[2*c + 1]));
+        }
+        R *= 1.0625f;
+
+        const int64_t t0 = ggml_time_us();
+        id<MTLBuffer> buf = [dev->mtl_device newBufferWithLength:(NSUInteger) G*G*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        uint16_t * cells = (uint16_t *) buf.contents;
+        dispatch_apply((size_t) G, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t y) {
+            const float qy = -R + ((float) y + 0.5f)*(2.0f*R/G);
+            for (int x = 0; x < G; ++x) {
+                const float qx = -R + ((float) x + 0.5f)*(2.0f*R/G);
+                cells[y*G + x] = (uint16_t) ggml_metal_neuron_nn(tbl, K, qx, qy);
+            }
+        });
+        dev->nn_grid[i]   = buf;
+        dev->nn_grid_r[i] = R;
+        GGML_LOG_DEBUG("%s: %s nearest-codeword grid %dx%d over +-%.3f built in %.1f ms\n", __func__,
+                ggml_type_name(type), G, G, R, (ggml_time_us() - t0)/1000.0);
+    }
+    [dev->nn_grid_lock unlock];
+
+    *r = dev->nn_grid_r[i];
+    *g = G;
+
+    return (struct ggml_metal_buffer_id) { (void *) dev->nn_grid[i], 0 };
+}
+
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
     @autoreleasepool {
+        for (int i = 0; i < 3; ++i) {
+            if (dev->nn_grid[i]) {
+                [dev->nn_grid[i] release];
+                dev->nn_grid[i] = nil;
+            }
+        }
+        [dev->nn_grid_lock release];
+
         ggml_metal_fusion_info_free(dev->finfo);
 
         ggml_metal_rsets_free(dev->rsets);
@@ -1827,10 +1912,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
+            // K and V of different types are each dequantized to f16 first, so each must be f16 or have that kernel
             if (op->src[1]->type != op->src[2]->type) {
-                return false;
+                for (int i = 1; i <= 2; ++i) {
+                    const enum ggml_type t = op->src[i]->type;
+                    if (t != GGML_TYPE_F16 && !ggml_is_quantized(t)) {
+                        return false;
+                    }
+                }
             }
-            switch (op->src[1]->type) {
+            for (int i = 1; i <= 2; ++i) {
+            switch (op->src[i]->type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
                 case GGML_TYPE_Q8_0:
@@ -1861,6 +1953,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     break;
                 default:
                     return false;
+            }
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_LIGHTNING_INDEXER:

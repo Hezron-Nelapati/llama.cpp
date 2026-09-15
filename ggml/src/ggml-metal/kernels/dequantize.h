@@ -1111,3 +1111,35 @@ void dequantize_neuron_v##SFX(device const block_neuron_v##SFX *xb, short il,   
 NEURON_V_DEQ(4)
 NEURON_V_DEQ(5)
 NEURON_V_DEQ(6)
+
+// neuron_v* for the attention vec kernels, which walk a cache row 4 values at a time: `il` is
+// a 4-value slice, so it is 2 pairs inside sub-block il/4 and the codes sit at bit 2*il*B.
+// Nothing is rebuilt into a buffer; the kernel folds these 4 values straight into q.k and
+// into the weighted value sum. B=10 and B=12 codes span two bytes, B=8 exactly one.
+#define NEURON_V_DEQ_T4(SFX)                                                              \
+template <typename type4>                                                                 \
+void dequantize_neuron_v##SFX##_t4(device const block_neuron_v##SFX *xb, short il,        \
+                                   thread type4 & reg) {                                  \
+    const int B   = NEURON_VQ##SFX##_BITS;                                                \
+    const int bs_ = (il >> 2) * NEURON_VQ##SFX##_SBB;                                     \
+    uint      sv  = (uint) xb->sb[bs_ >> 3];                                              \
+    if (((bs_ & 7) + NEURON_VQ##SFX##_SBB) > 8) {                                         \
+        sv |= (uint) xb->sb[(bs_ >> 3) + 1] << 8;                                         \
+    }                                                                                     \
+    const float d = (float) xb->d                                                         \
+                  * NEURON_VQ##SFX##_SBT[(sv >> (bs_ & 7))                                \
+                                         & ((1u << NEURON_VQ##SFX##_SBB) - 1u)];          \
+    uint c[2];                                                                            \
+    FOR_UNROLL (short h = 0; h < 2; ++h) {                                                \
+        const int bt = (2*il + h) * B;                                                    \
+        uint      cw = (uint) xb->qs[bt >> 3];                                            \
+        if (B > 8) { cw |= (uint) xb->qs[(bt >> 3) + 1] << 8; }                           \
+        c[h] = (cw >> (bt & 7)) & (NEURON_VQ##SFX##_K - 1);                               \
+    }                                                                                     \
+    reg = (type4) float4(d * kNeuronVQ##SFX[2*c[0]], d * kNeuronVQ##SFX[2*c[0] + 1],      \
+                         d * kNeuronVQ##SFX[2*c[1]], d * kNeuronVQ##SFX[2*c[1] + 1]);     \
+}
+
+NEURON_V_DEQ_T4(4)
+NEURON_V_DEQ_T4(5)
+NEURON_V_DEQ_T4(6)

@@ -2702,7 +2702,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    cparams.n_ctx_init_seq,
+                                    cparams.kv_grow_margin);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2723,7 +2725,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                "",
+                                cparams.n_ctx_init_seq,
+                                cparams.kv_grow_margin);
                     }
                 }
             }

@@ -330,13 +330,10 @@ void quantize_neuron_v##SFX(device const float * src, device block_neuron_v##SFX
         for (int t = 0; t < PSB; ++t) {                                                   \
             const int   p  = sblk*PSB + t;                                                \
             const float ax = src[2*p] * inv, ay = src[2*p + 1] * inv;                     \
-            int   bc = 0;                                                                 \
-            float bv = -INFINITY;                                                         \
-            for (int c = 0; c < NEURON_VQ##SFX##_K; ++c) {                                \
-                const float cx = kNeuronVQ##SFX[2*c], cy = kNeuronVQ##SFX[2*c + 1];       \
-                const float v  = 2.0f*(ax*cx + ay*cy) - (cx*cx + cy*cy);                  \
-                if (v > bv) { bv = v; bc = c; }                                           \
-            }                                                                             \
+            /* exact nearest codeword in a thin annulus of the radius-sorted table: a scan \
+               of all K per pair per token was the whole cost of generation at v5 and v6 */ \
+            float d2 = 0.0f;                                                              \
+            const int bc = neuron_vq##SFX##_nn_gpu(ax, ay, d2);                           \
             const int bit = p * B;                                                        \
             qbuf[bit >> 3] |= (uint8_t)(bc << (bit & 7));                                 \
             if (((bit & 7) + B) > 8)  { qbuf[(bit >> 3) + 1] |= (uint8_t)(bc >> (8 - (bit & 7))); }\
@@ -480,6 +477,77 @@ NEURON_V_QUANT_SS(6)
 NEURON_V_QUANT(4)
 NEURON_V_QUANT(5)
 NEURON_V_QUANT(6)
+
+// KV encoder with the nearest codeword read from a grid (ggml_metal_device_get_neuron_nn_grid): one
+// read per pair and the same control flow in every lane, where the annulus walk above takes a
+// data-dependent number of steps and the lanes of a simdgroup wait for the longest. Same block layout
+// and the same sub-block multiplier choice; a pair within a hundredth of a codeword spacing of a
+// Voronoi edge can take the neighbour, which is a smaller error than the search saves in time.
+#define NEURON_V_QUANT_GRID(SFX)                                                          \
+void quantize_neuron_v##SFX##_grid(device const float * src, device block_neuron_v##SFX & dst, \
+                                   device const ushort * grid, float R, int G) {          \
+    const int NP  = QK_NEURON / 2;                                                        \
+    const int PSB = NEURON_VQ_SBV / 2;                                                    \
+    const int B   = NEURON_VQ##SFX##_BITS;                                                \
+    const int SBB = NEURON_VQ##SFX##_SBB;                                                 \
+    const int NSBT = 1 << SBB;                                                            \
+                                                                                          \
+    float amax = 0.0f;                                                                    \
+    for (int j = 0; j < QK_NEURON; ++j) { amax = fmax(amax, fabs(src[j])); }              \
+    dst.d = (half) amax;                                                                  \
+    const float d = (float) dst.d;                                                        \
+                                                                                          \
+    uint8_t sbuf[NEURON_VQ_SBBY(12)];                                                     \
+    for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { sbuf[i] = 0; }                        \
+    uint8_t qbuf[QK_NEURON / 2 * 12 / 8];                                                 \
+    for (int i = 0; i < NP * B / 8; ++i) { qbuf[i] = 0; }                                 \
+                                                                                          \
+    const float cell = G / (2.0f * R);                                                    \
+    for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                    \
+        float sa = 0.0f;                                                                  \
+        for (int t = 0; t < NEURON_VQ_SBV; ++t) {                                         \
+            sa = fmax(sa, fabs(src[sblk*NEURON_VQ_SBV + t]));                             \
+        }                                                                                 \
+        const float want = d > 0.0f ? sa / d : 0.0f;                                      \
+        int   mj = 0;                                                                     \
+        float mb = INFINITY;                                                              \
+        for (int j = 0; j < NSBT; ++j) {                                                  \
+            const float e = fabs(NEURON_VQ##SFX##_SBT[j] - want);                         \
+            const bool  b = e < mb;                                                       \
+            mb = b ? e : mb;                                                              \
+            mj = b ? j : mj;                                                              \
+        }                                                                                 \
+        const int sbit = sblk * SBB;                                                      \
+        sbuf[sbit >> 3] |= (uint8_t)(mj << (sbit & 7));                                   \
+        if (((sbit & 7) + SBB) > 8) {                                                     \
+            sbuf[(sbit >> 3) + 1] |= (uint8_t)(mj >> (8 - (sbit & 7)));                   \
+        }                                                                                 \
+                                                                                          \
+        const float g   = d * NEURON_VQ##SFX##_SBT[mj];                                   \
+        const float inv = g > 0.0f ? 1.0f / g : 0.0f;                                     \
+        for (int t = 0; t < PSB; ++t) {                                                   \
+            const int p  = sblk*PSB + t;                                                  \
+            float     ax = src[2*p] * inv, ay = src[2*p + 1] * inv;                       \
+            /* past the codebook's outer ring: onto it along the same ray */              \
+            const float r2 = ax*ax + ay*ay;                                               \
+            const float s  = r2 > R*R ? 0.999f * R / sqrt(r2) : 1.0f;                     \
+            ax *= s; ay *= s;                                                             \
+            const int gx = clamp((int) ((ax + R) * cell), 0, G - 1);                      \
+            const int gy = clamp((int) ((ay + R) * cell), 0, G - 1);                      \
+            const int bc = grid[gy*G + gx];                                               \
+            const int bit = p * B;                                                        \
+            qbuf[bit >> 3] |= (uint8_t)(bc << (bit & 7));                                 \
+            if (((bit & 7) + B) > 8)  { qbuf[(bit >> 3) + 1] |= (uint8_t)(bc >> (8 - (bit & 7))); }\
+            if (((bit & 7) + B) > 16) { qbuf[(bit >> 3) + 2] |= (uint8_t)(bc >> (16 - (bit & 7))); }\
+        }                                                                                 \
+    }                                                                                     \
+    for (int i = 0; i < NEURON_VQ_SBBY(SBB); ++i) { dst.sb[i] = sbuf[i]; }                \
+    for (int i = 0; i < NP * B / 8; ++i) { dst.qs[i] = qbuf[i]; }                         \
+}
+
+NEURON_V_QUANT_GRID(4)
+NEURON_V_QUANT_GRID(5)
+NEURON_V_QUANT_GRID(6)
 
 #define NEURON_QUANT(LP)                                                                    \
 void quantize_neuron_m##LP(device const float * src, device block_neuron_m##LP & dst) {   \

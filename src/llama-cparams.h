@@ -10,6 +10,8 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_ctx_init_seq;  // KV cells per sequence allocated at start (== n_ctx_seq when growth is off)
+    uint32_t kv_grow_margin;  // MiB of device memory kept free when the KV cache grows
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

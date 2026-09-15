@@ -8,11 +8,18 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -79,7 +86,9 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                 uint32_t   kv_size_init,
+                 uint32_t   grow_margin_mib) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -90,6 +99,12 @@ llama_kv_cache::llama_kv_cache(
     // follows the source allocation: a fitted target can be smaller than the
     // draft default and oversized views would overflow the source tensors
     if (other) {
+        // the views taken below must stay valid, so the source stops growing at its full size
+        if (other->get_size() < other->size_max && !other->grow(other->size_max)) {
+            throw std::runtime_error("failed to grow the shared source kv cache to its full size");
+        }
+        other->size_max = other->get_size();
+
         const uint32_t size_other = other->get_size();
         if (kv_size != size_other) {
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
@@ -98,6 +113,21 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    size_max    = kv_size;
+    grow_margin = size_t(grow_margin_mib)*1024*1024;
+
+    if (!other && kv_size_init > 0 && kv_size_init < kv_size) {
+        const uint32_t size_init = GGML_PAD(kv_size_init, std::max(n_pad, 256u));
+        if (size_init < kv_size) {
+            kv_size = size_init;
+        }
+    }
+
+    size_init = kv_size;
+
+    // a growable cache gives every layer its own buffer, so growing holds one layer twice, not the whole cache
+    const bool growable = kv_size < size_max;
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -109,8 +139,28 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    // growable: one context per layer, allocated in this order
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctx_layers;
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        if (growable) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            ctx_layers.emplace_back(buft, ctx);
+
+            return ctx;
+        }
+
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
@@ -185,7 +235,8 @@ llama_kv_cache::llama_kv_cache(
                 map_layer_ids[il] = layers.size();
 
                 layers.push_back(layer_share);
-                layers.back().il = il;
+                layers.back().il   = il;
+                layers.back().ibuf = -1;
 
                 continue;
             }
@@ -246,7 +297,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, growable ? (int32_t) ctx_layers.size() - 1 : -1, });
     }
 
     if (reuse) {
@@ -273,8 +324,14 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
+        ctx_layers.emplace_back(buft, std::move(ctx));
+    }
+
+    std::map<std::string, size_t> buf_sizes;
+
+    // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    for (auto & [buft, ctx] : ctx_layers) {
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -288,10 +345,14 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        buf_sizes[ggml_backend_buffer_name(buf)] += ggml_backend_buffer_get_size(buf);
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    for (const auto & [name, size] : buf_sizes) {
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, name.c_str(), size/1024.0/1024.0);
     }
 
     {
@@ -302,6 +363,10 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        if (growable) {
+            LLAMA_LOG_INFO("%s: grows on demand up to %u cells, keeping %zu MiB free\n", __func__, size_max, grow_margin/1024/1024);
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -745,7 +810,10 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
     bool do_shift = get_has_shift();
 
-    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
+    // growing is the optimization for a batch that did not fit
+    const uint32_t n_grow = optimize ? grow_want : 0;
+
+    return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info), n_grow);
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
@@ -808,13 +876,24 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     if (!success) {
+        if (get_size() < size_max) {
+            uint32_t n_tokens = 0;
+            for (const auto & ubatch : ubatches) {
+                n_tokens += ubatch.n_tokens;
+            }
+
+            grow_want = get_size() + n_tokens;
+        }
+
         return {};
     }
+
+    grow_want = 0;
 
     return res;
 }
 
-bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, uint32_t n_grow) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -823,6 +902,13 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     bool updated = false;
 
     auto * sched = lctx->get_sched();
+
+    if (n_grow > 0) {
+        llama_synchronize(lctx);
+
+        updated = grow(n_grow);
+        grow_want = 0;
+    }
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
@@ -1202,8 +1288,289 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_size_max() const {
+    return size_max;
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+uint32_t llama_kv_cache::get_layout_gen() const {
+    return layout_gen;
+}
+
+// memory the system can still hand out, SIZE_MAX when unknown
+static size_t llama_host_mem_available() {
+#if defined(__APPLE__)
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) {
+        return SIZE_MAX;
+    }
+    int64_t total = 0;
+    size_t len = sizeof(total);
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) {
+        return SIZE_MAX;
+    }
+    // what Activity Monitor calls used: app memory + wired + compressed
+    const uint64_t used = ((uint64_t) vm.internal_page_count - vm.purgeable_count + vm.wire_count + vm.compressor_page_count)*vm_kernel_page_size;
+    return (uint64_t) total > used ? (size_t) (total - used) : 0;
+#elif defined(__linux__)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) {
+        return SIZE_MAX;
+    }
+    char line[256];
+    size_t res = SIZE_MAX;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long long kb;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            res = (size_t) kb*1024;
+            break;
+        }
+    }
+    fclose(f);
+    return res;
+#else
+    return SIZE_MAX;
+#endif
+}
+
+bool llama_kv_cache::grow(uint32_t n_cells) {
+    const uint32_t size_old = get_size();
+    const uint32_t size_new = std::min(size_max, (uint32_t) GGML_PAD(std::max(2*size_old, n_cells), std::max(n_pad, 256u)));
+
+    if (size_new <= size_old || other) {
+        return false;
+    }
+
+    // what growing adds on each buffer type, plus the largest old layer, which is still held while its copy is made
+    std::map<ggml_backend_buffer_type_t, size_t> added;
+    std::map<ggml_backend_buffer_type_t, size_t> held;
+    for (const auto & layer : layers) {
+        if (layer.ibuf < 0) {
+            continue;
+        }
+
+        size_t cell = 0;
+        cell += ggml_row_size(layer.k->type, layer.k->ne[0]);
+        cell += layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) : 0;
+        cell *= n_stream;
+
+        const auto buft = ggml_backend_buffer_get_type(ctxs_bufs[layer.ibuf].second.get());
+
+        added[buft] += cell*(size_new - size_old);
+        held[buft]   = std::max(held[buft], cell*size_old);
+    }
+
+    size_t need_host = 0;
+    for (const auto & [buft, n_added] : added) {
+        const size_t n = n_added + held[buft];
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+
+        const enum ggml_backend_dev_type type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+
+        if (dev && type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+
+            if (total > 0 && free < n + grow_margin) {
+                LLAMA_LOG_WARN("%s: cannot grow to %u cells: %s needs %.0f MiB and %.0f MiB free, has %.0f MiB\n", __func__,
+                        size_new, ggml_backend_dev_name(dev), n/1048576.0, grow_margin/1048576.0, free/1048576.0);
+                return false;
+            }
+        }
+
+        // memory on the host, or shared with it
+#if defined(__APPLE__)
+        need_host += n;
+#else
+        if (type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU || ggml_backend_buft_is_host(buft)) {
+            need_host += n;
+        }
+#endif
+    }
+
+    if (need_host > 0) {
+        const size_t avail = llama_host_mem_available();
+
+        if (avail < need_host + grow_margin) {
+            LLAMA_LOG_WARN("%s: cannot grow to %u cells: needs %.0f MiB and %.0f MiB free, the system has %.0f MiB available\n", __func__,
+                    size_new, need_host/1048576.0, grow_margin/1048576.0, avail/1048576.0);
+            return false;
+        }
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i].ibuf < 0) {
+            continue;
+        }
+
+        if (!resize_layer(layers[i], size_new)) {
+            LLAMA_LOG_WARN("%s: cannot grow to %u cells: allocation failed at layer %d\n", __func__, size_new, layers[i].il);
+
+            for (size_t j = 0; j < i; ++j) {
+                if (layers[j].ibuf >= 0 && !resize_layer(layers[j], size_old)) {
+                    GGML_ABORT("failed to restore the kv cache after a failed grow");
+                }
+            }
+
+            ++layout_gen;
+
+            return false;
+        }
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].grow(size_new);
+    }
+
+    ++layout_gen;
+
+    LLAMA_LOG_INFO("%s: grew to %u cells, %.2f MiB, in %.1f ms\n", __func__,
+            size_new, (size_k_bytes() + size_v_bytes())/1048576.0, (ggml_time_us() - t_start_us)/1000.0);
+
+    return true;
+}
+
+bool llama_kv_cache::shrink() {
+    const uint32_t size_old = get_size();
+
+    if (other || size_old <= size_init) {
+        return false;
+    }
+
+    uint32_t used = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        used = std::max(used, v_cells[s].used_max_p1());
+    }
+
+    const uint32_t size_new = std::max(size_init, (uint32_t) GGML_PAD(used, std::max(n_pad, 256u)));
+    if (size_new >= size_old) {
+        return false;
+    }
+
+    for (auto & layer : layers) {
+        if (layer.ibuf >= 0 && !resize_layer(layer, size_new)) {
+            GGML_ABORT("failed to allocate a smaller kv cache layer");
+        }
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].shrink(size_new);
+        if (v_heads[s] >= size_new) {
+            v_heads[s] = 0;
+        }
+    }
+
+    grow_want = 0;
+    ++layout_gen;
+
+    LLAMA_LOG_INFO("%s: shrank to %u cells, %.2f MiB\n", __func__, size_new, (size_k_bytes() + size_v_bytes())/1048576.0);
+
+    return true;
+}
+
+bool llama_kv_cache::resize_layer(kv_layer & layer, uint32_t size_new) {
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[layer.ibuf].second.get());
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*(1 + n_stream)*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+
+    auto make = [&](const ggml_tensor * src, std::vector<ggml_tensor *> & views) -> ggml_tensor * {
+        views.assign(n_stream, nullptr);
+        if (!src) {
+            return nullptr;
+        }
+
+        ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), src->type, src->ne[0], size_new, n_stream);
+        ggml_set_name(t, src->name);
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            views[s] = ggml_view_2d(ctx.get(), t, t->ne[0], size_new, t->nb[1], s*t->nb[2]);
+        }
+
+        return t;
+    };
+
+    std::vector<ggml_tensor *> k_stream;
+    std::vector<ggml_tensor *> v_stream;
+
+    ggml_tensor * k = make(layer.k, k_stream);
+    ggml_tensor * v = make(layer.v, v_stream);
+
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        return false;
+    }
+
+    ggml_backend_buffer_clear(buf.get(), 0);
+
+    ggml_init_params params_view = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx_view { ggml_init(params_view) };
+
+    auto copy = [&](ggml_tensor * src, size_t offs_src, ggml_tensor * dst, size_t offs_dst, int64_t ne) {
+        ggml_reset(ctx_view.get());
+
+        ggml_tensor * a = ggml_view_1d(ctx_view.get(), src, ne, offs_src);
+        ggml_tensor * b = ggml_view_1d(ctx_view.get(), dst, ne, offs_dst);
+
+        ggml_backend_view_init(a);
+        ggml_backend_view_init(b);
+
+        ggml_backend_tensor_copy(a, b);
+    };
+
+    // cells [0, n) of every stream keep their index
+    const int64_t n = std::min(layer.k->ne[1], (int64_t) size_new);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        copy(layer.k, s*layer.k->nb[2], k, s*k->nb[2], n*k->ne[0]);
+
+        if (!v) {
+            continue;
+        }
+
+        if (!v_trans) {
+            copy(layer.v, s*layer.v->nb[2], v, s*v->nb[2], n*v->ne[0]);
+        } else {
+            // transposed: element j of cell c sits at j*size + c
+            GGML_ASSERT(!ggml_is_quantized(v->type));
+
+            const size_t el = ggml_type_size(v->type);
+
+            for (int64_t j = 0; j < v->ne[0]; ++j) {
+                copy(layer.v, s*layer.v->nb[2] + j*layer.v->ne[1]*el, v, s*v->nb[2] + j*size_new*el, n);
+            }
+        }
+    }
+
+    ctxs_bufs[layer.ibuf] = { std::move(ctx), std::move(buf) };
+
+    layer.k = k;
+    layer.v = v;
+    layer.k_stream = std::move(k_stream);
+    layer.v_stream = std::move(v_stream);
+
+    return true;
 }
 
 bool llama_kv_cache::get_has_shift() const {
@@ -2416,6 +2783,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
+            if (cells.size() - cells.get_used() < cell_count && cells.size() < size_max) {
+                grow(cells.get_used() + cell_count);
+            }
+
             sinfo = find_slot(ubatch, false);
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
@@ -2448,6 +2819,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
     } else {
         // whole KV cache restore
+
+        if (cell_count > cells.size() && cells.size() < size_max) {
+            grow(cell_count);
+        }
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
@@ -2688,8 +3063,9 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_context * lctx,
         bool do_shift,
-        stream_copy_info sc_info) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)) {
-    if (!do_shift && this->sc_info.empty()) {
+        stream_copy_info sc_info,
+        uint32_t n_grow) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), lctx(lctx), do_shift(do_shift), sc_info(std::move(sc_info)), n_grow(n_grow) {
+    if (!do_shift && this->sc_info.empty() && n_grow == 0) {
         status = LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
 }
@@ -2717,7 +3093,7 @@ bool llama_kv_cache_context::apply() {
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
-        kv->update(lctx, do_shift, sc_info);
+        kv->update(lctx, do_shift, sc_info, n_grow);
 
         return true;
     }

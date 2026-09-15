@@ -114,7 +114,11 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // cells allocated at start; the cache grows on demand up to kv_size (0 = allocate kv_size)
+                     uint32_t   kv_size_init = 0,
+        // MiB of memory that must stay free after growing
+                     uint32_t   grow_margin_mib = 0);
 
     ~llama_kv_cache() = default;
 
@@ -156,7 +160,16 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_size_max() const;
     uint32_t get_n_stream() const;
+
+    uint32_t get_layout_gen() const override;
+
+    bool shrink() override;
+
+    // reallocate the cache to hold at least n_cells cells (doubling, capped at get_size_max())
+    // refused when the memory left afterwards would drop below the margin
+    bool grow(uint32_t n_cells);
 
     bool get_has_shift() const;
 
@@ -201,7 +214,7 @@ public:
     // return empty vector on failure
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
-    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+    bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info, uint32_t n_grow = 0);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -257,9 +270,21 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // index in ctxs_bufs of the buffer holding only this layer, -1 when shared with other layers
+        int32_t ibuf = -1;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // growth
+    uint32_t size_max    = 0;
+    uint32_t size_init   = 0; // what it started with, and never shrinks below
+    size_t   grow_margin = 0; // bytes
+    uint32_t grow_want   = 0; // cells the last failed prepare() needed, consumed by the next optimizing update
+    uint32_t layout_gen  = 0; // bumped whenever the tensors are reallocated
+
+    bool resize_layer(kv_layer & layer, uint32_t size_new);
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -365,7 +390,8 @@ public:
             llama_kv_cache * kv,
             llama_context * lctx,
             bool do_shift,
-            stream_copy_info sc_info);
+            stream_copy_info sc_info,
+            uint32_t n_grow = 0);
 
     // used to create a batch processing context from a batch
     llama_kv_cache_context(
@@ -442,6 +468,8 @@ private:
     bool do_shift = false;
 
     stream_copy_info sc_info;
+
+    uint32_t n_grow = 0;
 
     //
     // batch processing context

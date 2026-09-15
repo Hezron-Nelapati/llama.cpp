@@ -303,9 +303,19 @@ llama_context::llama_context(
         }
     }
 
+    cparams.n_ctx_init_seq = cparams.n_ctx_seq;
+    if (params.n_ctx_init > 0) {
+        const uint32_t per_seq = cparams.kv_unified ? params.n_ctx_init : params.n_ctx_init / cparams.n_seq_max;
+        cparams.n_ctx_init_seq = std::min(cparams.n_ctx_seq, (uint32_t) GGML_PAD(std::max(per_seq, 1u), 256));
+    }
+    cparams.kv_grow_margin = params.kv_grow_margin;
+
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
+    if (cparams.n_ctx_init_seq < cparams.n_ctx_seq) {
+        LLAMA_LOG_INFO("%s: n_ctx_init_seq        = %u (grows on demand, margin %u MiB)\n", __func__, cparams.n_ctx_init_seq, cparams.kv_grow_margin);
+    }
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
@@ -483,7 +493,8 @@ llama_context::~llama_context() {
     synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.hparams.no_alloc && !opt_ctx) {
+    // a grown KV cache attends more cells than the expectation was measured at
+    if (!model.hparams.no_alloc && !opt_ctx && !(memory && memory->get_layout_gen() > 0)) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -843,6 +854,24 @@ bool llama_context::memory_update(bool optimize) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
     }
+
+    return true;
+}
+
+bool llama_context::memory_shrink() {
+    if (!memory) {
+        return false;
+    }
+
+    synchronize();
+
+    if (!memory->shrink()) {
+        return false;
+    }
+
+    // a new scheduler frees the compute buffers that were sized for the larger cache
+    sched_need_reserve = true;
+    sched_reserve();
 
     return true;
 }
@@ -1346,6 +1375,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    // the previous graph holds views of memory tensors that have since been reallocated
+    const uint32_t layout_gen = memory ? memory->get_layout_gen() : 0;
+    if (layout_gen != gf_res_prev_layout_gen) {
+        gf_res_prev_layout_gen = layout_gen;
+        res->reset();
+    }
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -3618,7 +3654,9 @@ void llama_context::opt_epoch(
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
-        /*.n_batch                     =*/ 2048,
+        /*.n_ctx_init                  =*/ 0,
+        /*.kv_grow_margin              =*/ 1024,
+        /*.n_batch                    =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
@@ -4025,6 +4063,10 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     }
 
     mem->clear(data);
+}
+
+bool llama_memory_shrink(llama_context * ctx) {
+    return ctx->memory_shrink();
 }
 
 bool llama_memory_seq_rm(

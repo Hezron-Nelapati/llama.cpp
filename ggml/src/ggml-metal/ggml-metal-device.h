@@ -180,7 +180,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(
         ggml_metal_library_t lib,
-        const struct ggml_tensor * op);
+        enum ggml_type type);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk(
         ggml_metal_library_t lib,
@@ -354,6 +354,10 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+
+// nearest codeword of the active neuron_v codebook for every cell of a g x g grid over [-r, r]^2,
+// built once per device and type; the KV encoder reads it instead of searching the codebook
+struct ggml_metal_buffer_id ggml_metal_device_get_neuron_nn_grid(ggml_metal_device_t dev, enum ggml_type type, float * r, int * g);
 
 #ifdef __cplusplus
 }
