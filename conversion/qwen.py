@@ -302,6 +302,11 @@ class _QwenMtpMixin:
             if n_mtp == 0:
                 assert self.opt_num_mtp_layers != 0
                 n_mtp = self.opt_num_mtp_layers
+            elif self.opt_num_mtp_layers == 0:
+                # fine-tunes saved without the MTP block keep it in their config; declaring it would
+                # have the loader look for blk.N tensors the file does not have
+                logger.warning(f"config declares {n_mtp} MTP layer(s) but the checkpoint has no mtp.* tensors; exporting without MTP")
+                n_mtp = 0
             self.block_count += n_mtp
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
