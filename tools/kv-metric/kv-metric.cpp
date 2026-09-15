@@ -174,13 +174,25 @@ struct fold_patch {
 // before any calibration: every attention layer needs float q/k norms, or float q/k projections
 static int check_foldable(const gguf_context * g, const ggml_context * meta) {
     std::map<int, bool> layers;
+    std::map<int, bool> recurrent;
     for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
         int il = -1;
         char rest[128];
-        if (sscanf(gguf_get_tensor_name(g, i), "blk.%d.%127s", &il, rest) == 2 &&
-                (strcmp(rest, "attn_k.weight") == 0 || strcmp(rest, "attn_k_norm.weight") == 0 || strcmp(rest, "attn_qkv.weight") == 0)) {
+        if (sscanf(gguf_get_tensor_name(g, i), "blk.%d.%127s", &il, rest) != 2) {
+            continue;
+        }
+        // A recurrent layer keeps a state, not a KV cache, and its fused attn_qkv feeds the SSM: there
+        // is no q.k to correct. Hybrids (Qwen3.5) interleave them with real attention layers, and
+        // failing on the first one refused the whole model.
+        if (strncmp(rest, "ssm_", 4) == 0) {
+            recurrent[il] = true;
+        } else if (strcmp(rest, "attn_k.weight") == 0 || strcmp(rest, "attn_k_norm.weight") == 0 ||
+                   strcmp(rest, "attn_qkv.weight") == 0) {
             layers[il] = true;
         }
+    }
+    for (const auto & [il, _] : recurrent) {
+        layers.erase(il);
     }
     for (const auto & [il, _] : layers) {
         const std::string p = "blk." + std::to_string(il) + ".";
