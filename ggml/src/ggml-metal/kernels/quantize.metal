@@ -235,132 +235,87 @@ NEURON_V_CPY(4)
 NEURON_V_CPY(5)
 NEURON_V_CPY(6)
 
-// neuron_l4 weight encoding: the CPU search, refit included, with 32 lanes sharing a block.
-// Nearest level for t = |x|/g is a count of boundaries below t and its reconstruction is the
-// same count as steps, so a lane does no table read. kNeuronL4 is a source constant, so the
-// boundaries and steps fold at compile time.
-static inline float neuron_l4_rec_gpu(float t, thread int & n) {
-    float r = kNeuronL4[8];
-    n = 0;
-    for (int k = 0; k < 7; ++k) {
-        const int above = t > 0.5f*(kNeuronL4[8 + k] + kNeuronL4[9 + k]) ? 1 : 0;
-        r += (float) above * (kNeuronL4[9 + k] - kNeuronL4[8 + k]);
-        n += above;
-    }
-    return r;
-}
-
-#define NEURON_L4_CPY_PASS                                                                \
-    for (int u = tiisg; u < NSB*16; u += 32) {                                            \
-        threadgroup float * a = sa + (u / 16) * SBV;                                      \
-        const float  g  = d * kNeuronVQSB[u % 16];                                        \
-        float e2 = INFINITY;                                                              \
-        if (g > 0.0f) {                                                                   \
-            const float inv = 1.0f / g;                                                   \
-            e2 = 0.0f;                                                                    \
-            for (int v = 0; v < SBV; ++v) {                                               \
-                int n = 0;                                                                \
-                const float e = a[v] - g * neuron_l4_rec_gpu(a[v] * inv, n);              \
-                e2 += e * e;                                                              \
-            }                                                                             \
-        }                                                                                 \
-        sse[u] = e2;                                                                      \
-    }                                                                                     \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
-    if (tiisg < NSB) {                                                                    \
-        int   mj = 0;                                                                     \
-        float mb = INFINITY;                                                              \
-        for (int j = 0; j < 16; ++j) {                                                    \
-            if (sse[tiisg*16 + j] < mb) { mb = sse[tiisg*16 + j]; mj = j; }               \
-        }                                                                                 \
-        smj[tiisg] = (uchar) mj;                                                          \
-    }                                                                                     \
-    threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
-    for (int v = tiisg; v < NB; v += 32) {                                                \
-        const float g = d * kNeuronVQSB[smj[v / SBV]];                                    \
-        int n = 0;                                                                        \
-        if (g > 0.0f) { neuron_l4_rec_gpu(sa[v] / g, n); }                                \
-        idx[v] = (uchar) n;                                                               \
-    }                                                                                     \
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-#define NEURON_L4_CPY_REFIT                                                               \
-    {                                                                                     \
-        float num = 0.0f, den = 0.0f;                                                     \
-        for (int v = tiisg; v < NB; v += 32) {                                            \
-            const float r = kNeuronVQSB[smj[v / SBV]] * kNeuronL4[8 + idx[v]];            \
-            num += sa[v] * r;                                                             \
-            den += r * r;                                                                 \
-        }                                                                                 \
-        num = simd_sum(num);                                                              \
-        den = simd_sum(den);                                                              \
-        if (den > 0.0f && num > 0.0f) {                                                   \
-            const float dn = (float) (half) (num / den);                                  \
-            if (dn > 0.0f) { d = dn; }                                                    \
-        }                                                                                 \
-    }
-
+// neuron_l4 weight encoding: quantize_row_neuron_l4_ref, one thread per block. The search is light
+// (16 multipliers x 16 values x 7 compares per sub-block, three passes), so it runs whole inside a
+// thread with no lanes and no barriers. The nearest level for t = |x|/g is a count of boundaries and
+// its value the same count in steps; kNeuronL4 is a source constant, so both fold at compile time.
 kernel void kernel_cpy_f32_neuron_l4(
         constant ggml_metal_kargs_cpy & args,
         device const char * src0,
         device       char * dst,
-        threadgroup char  * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_threadgroup]]) {
-    const int NB  = QK_NEURON;
-    const int SBV = NEURON_VQ_SBV;
-    const int NSB = NEURON_VQ_NSB;
-
-    threadgroup float * sa  = (threadgroup float *) shmem;
-    threadgroup float * sse = (threadgroup float *) (shmem + NB*4);
-    threadgroup uchar * idx = (threadgroup uchar *) (shmem + NB*8);
-    threadgroup uchar * smj = (threadgroup uchar *) (shmem + NB*9);
-
-    const int64_t ib  = tgpig.x;
-    const int64_t i01 = tgpig.y;
-    const int64_t i02 = tgpig.z % args.ne02;
-    const int64_t i03 = tgpig.z / args.ne02;
-    if (ib >= args.nk0 || i01 >= args.ne01) { return; }
+        uint3 tpig[[thread_position_in_grid]]) {
+    const int64_t ib  = tpig.x;
+    const int64_t i01 = tpig.y;
+    const int64_t i02 = tpig.z % args.ne02;
+    const int64_t i03 = tpig.z / args.ne02;
+    if (ib >= args.nk0 || i01 >= args.ne01 || i03 >= args.ne03) { return; }
 
     device const float * src = (device const float *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01) + ib*QK_NEURON;
     device block_neuron_l4 * pd = (device block_neuron_l4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1) + ib;
 
-    float a = 0.0f;
-    for (int j = tiisg; j < NB; j += 32) {
-        const float v = fabs(src[j]);
-        sa[j] = v;
-        a = max(a, v);
+    float bnd[7], stp[7];
+    for (int k = 0; k < 7; ++k) {
+        bnd[k] = 0.5f*(kNeuronL4[8 + k] + kNeuronL4[9 + k]);
+        stp[k] = kNeuronL4[9 + k] - kNeuronL4[8 + k];
     }
-    a = simd_max(a);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (a == 0.0f) {
-        if (tiisg == 0) {
-            pd->d = (half) 0.0f;
-            for (int i = 0; i < 4;    ++i) { pd->sb[i] = 0; }
-            for (int i = 0; i < NB/2; ++i) { pd->qs[i] = 0; }
-        }
+    float ax[QK_NEURON];
+    float amax = 0.0f;
+    for (int j = 0; j < QK_NEURON; ++j) { ax[j] = fabs(src[j]); amax = max(amax, ax[j]); }
+    for (int i = 0; i < 4;           ++i) { pd->sb[i] = 0; }
+    for (int i = 0; i < QK_NEURON/2; ++i) { pd->qs[i] = 0; }
+    if (amax == 0.0f) {
+        pd->d = (half) 0.0f;
         return;
     }
-    float d = (float) (half) a;
 
-    NEURON_L4_CPY_PASS
-    NEURON_L4_CPY_REFIT
-    NEURON_L4_CPY_PASS
-    NEURON_L4_CPY_REFIT
-    NEURON_L4_CPY_PASS
+    uchar idx[QK_NEURON];
+    uchar mi[8];
+    float d = (float) (half) amax;
+    for (int it = 0; it < 3; ++it) {
+        for (int s = 0; s < 8; ++s) {
+            int   bj = 0;
+            float be = INFINITY;
+            for (int j = 0; j < 16; ++j) {
+                const float g = d * kNeuronVQSB[j], inv = 1.0f / g;
+                float e2 = 0.0f;
+                for (int v = s*16; v < s*16 + 16; ++v) {
+                    const float t = ax[v] * inv;
+                    float r = kNeuronL4[8];
+                    for (int k = 0; k < 7; ++k) { r += (t > bnd[k] ? 1.0f : 0.0f) * stp[k]; }
+                    const float e = ax[v] - g * r;
+                    e2 += e * e;
+                }
+                if (e2 < be) { be = e2; bj = j; }
+            }
+            mi[s] = (uchar) bj;
+            const float inv = 1.0f / (d * kNeuronVQSB[bj]);
+            for (int v = s*16; v < s*16 + 16; ++v) {
+                const float t = ax[v] * inv;
+                int n = 0;
+                for (int k = 0; k < 7; ++k) { n += t > bnd[k] ? 1 : 0; }
+                idx[v] = (uchar) n;
+            }
+        }
+        if (it == 2) { break; }
+        float num = 0.0f, den = 0.0f;
+        for (int v = 0; v < QK_NEURON; ++v) {
+            const float r = kNeuronVQSB[mi[v / 16]] * kNeuronL4[8 + idx[v]];
+            num += ax[v] * r;
+            den += r * r;
+        }
+        if (den <= 0.0f || num <= 0.0f) { break; }
+        const float dn = (float) (half) (num / den);
+        if (!(dn > 0.0f) || dn == d) { break; }
+        d = dn;
+    }
 
-    if (tiisg == 0) {
-        pd->d = (half) d;
-        for (int i = 0; i < 4;    ++i) { pd->sb[i] = 0; }
-        for (int i = 0; i < NB/2; ++i) { pd->qs[i] = 0; }
-        for (int s = 0; s < NSB; ++s) {
-            pd->sb[s >> 1] |= (uint8_t) (smj[s] << ((s & 1) * 4));
-        }
-        for (int v = 0; v < NB; ++v) {
-            const int n = src[v] < 0.0f ? 7 - idx[v] : 8 + idx[v];
-            pd->qs[v >> 1] |= (uint8_t) (n << ((v & 1) * 4));
-        }
+    pd->d = (half) d;
+    for (int s = 0; s < 8; ++s) {
+        pd->sb[s >> 1] |= (uint8_t) (mi[s] << ((s & 1) * 4));
+    }
+    for (int v = 0; v < QK_NEURON; ++v) {
+        const int n = src[v] < 0.0f ? 7 - idx[v] : 8 + idx[v];
+        pd->qs[v >> 1] |= (uint8_t) (n << ((v & 1) * 4));
     }
 }
 

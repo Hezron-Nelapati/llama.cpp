@@ -2221,17 +2221,30 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     // the whole ~65k-evaluation search on its own and the packing buffers sit in threadgroup
     // memory instead of spilling out of registers.
     switch (op->type) {
-        case GGML_TYPE_NEURON_L4:
+        case GGML_TYPE_NEURON_L4: {
+            // one thread per block: the lattice search fits in a thread, so no lanes and no shared memory
+            ggml_metal_kargs_cpy args_n = {
+                /*.nk0  =*/ nk0,
+                /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.ne03 =*/ ne03,
+                /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+                /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.ne2  =*/ ne2,  /*.ne3  =*/ ne3,
+                /*.nb0  =*/ nb0,  /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+            };
+            const int tx = (int) std::min<int64_t>(nk0, 32);
+            const int ty = std::max(1, 32 / tx);
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args_n, sizeof(args_n), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (nk0 + tx - 1)/tx, (ne01 + ty - 1)/ty, ne02*ne03, tx, ty, 1);
+            return 1;
+        }
         case GGML_TYPE_NEURON_V4:
         case GGML_TYPE_NEURON_V5:
         case GGML_TYPE_NEURON_V6: {
             const int nsbt = 1 << (op->type == GGML_TYPE_NEURON_V6 ? NEURON_VQ6_SBB : NEURON_VQ5_SBB);
-            const size_t smem = op->type == GGML_TYPE_NEURON_L4
-                ? QK_NEURON*sizeof(float)                      // |x| of the block
-                + NEURON_VQ_NSB*16*sizeof(float)               // sse per (sub-block, scale)
-                + QK_NEURON*sizeof(uint8_t)                    // magnitude index per value
-                + NEURON_VQ_NSB*sizeof(uint8_t)                // chosen multipliers
-                : QK_NEURON*sizeof(float)                      // the staged block
+            const size_t smem =
+                  QK_NEURON*sizeof(float)                      // the staged block
                 + NEURON_VQ_NSB*nsbt*sizeof(float)             // sse per (sub-block, scale)
                 + (QK_NEURON/2)*sizeof(uint16_t)               // chosen codes
                 + NEURON_VQ_NSB*sizeof(uint8_t);               // chosen multipliers

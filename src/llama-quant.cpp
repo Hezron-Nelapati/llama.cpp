@@ -1038,31 +1038,45 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
         return {};
     }
 
+    // Read only the sampled blocks, not whole tensors: on a 4B model reading every layer to pick
+    // 32768 blocks cost 9 s of a 52 s quantise. A block is 128 values of a row, so it is a whole
+    // number of source blocks for f32/f16/bf16/q8_0; other source types are read in full.
     const size_t per = std::max<size_t>(1, NBLK / src.size());
     std::vector<float> X;
     X.reserve(NBLK * BLK);
     std::vector<no_init<uint8_t>> buf;
     std::vector<float> f32;
     for (const auto * w : src) {
-        const ggml_tensor * t = w->tensor;
-        const size_t nelem = ggml_nelements(t);
-        const size_t sz    = ggml_nbytes(t);
-        buf.resize(sz);
-        const void * raw = ml.load_data_range(*w, 0, sz, buf.data());
-        f32.resize(nelem);
-        if (t->type == GGML_TYPE_F32) {
-            memcpy(f32.data(), raw, nelem * sizeof(float));
-        } else {
-            const auto * tt = ggml_get_type_traits(t->type);
-            if (!tt->to_float) {
-                continue;
-            }
-            tt->to_float(raw, f32.data(), (int64_t) nelem);
+        const ggml_tensor * t  = w->tensor;
+        const auto *        tt = ggml_get_type_traits(t->type);
+        if (t->type != GGML_TYPE_F32 && !tt->to_float) {
+            continue;
         }
-        const size_t nblk = nelem / BLK;
+        const size_t nelem = ggml_nelements(t);
+        const size_t nblk  = nelem / BLK;
+        const int64_t sblk = ggml_blck_size(t->type);
+        const bool   ranged = BLK % sblk == 0;
+        const size_t bbytes = ranged ? (size_t) (BLK / sblk) * ggml_type_size(t->type) : 0;
+        if (!ranged) {
+            buf.resize(ggml_nbytes(t));
+            f32.resize(nelem);
+            tt->to_float(ml.load_data_range(*w, 0, ggml_nbytes(t), buf.data()), f32.data(), (int64_t) nelem);
+        }
         for (size_t s = 0; s < std::min(per, nblk); ++s) {
             const size_t b = std::uniform_int_distribution<size_t>(0, nblk - 1)(rng);
-            X.insert(X.end(), f32.begin() + b * BLK, f32.begin() + (b + 1) * BLK);
+            X.resize(X.size() + BLK);
+            float * dstb = X.data() + X.size() - BLK;
+            if (!ranged) {
+                memcpy(dstb, f32.data() + b * BLK, BLK * sizeof(float));
+                continue;
+            }
+            buf.resize(bbytes);
+            const void * raw = ml.load_data_range(*w, b * bbytes, bbytes, buf.data());
+            if (t->type == GGML_TYPE_F32) {
+                memcpy(dstb, raw, BLK * sizeof(float));
+            } else {
+                tt->to_float(raw, dstb, BLK);
+            }
         }
     }
     const size_t nb = X.size() / BLK;
