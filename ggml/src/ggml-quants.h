@@ -151,12 +151,17 @@ NEURON_V_DECL(4)
 NEURON_V_DECL(5)
 NEURON_V_DECL(6)
 
-GGML_API void   quantize_row_neuron_l4_ref(const float * GGML_RESTRICT x,
-                                           block_neuron_l4 * GGML_RESTRICT y, int64_t k);
-GGML_API void   dequantize_row_neuron_l4(const block_neuron_l4 * GGML_RESTRICT x,
-                                         float * GGML_RESTRICT y, int64_t k);
-GGML_API size_t quantize_neuron_l4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
-                                   int64_t nrow, int64_t n_per_row, const float * quant_weights);
+#define NEURON_L_DECL(SFX)                                                                     \
+    GGML_API void   quantize_row_neuron_##SFX##_ref(const float * GGML_RESTRICT x,             \
+                                                    block_neuron_##SFX * GGML_RESTRICT y, int64_t k); \
+    GGML_API void   dequantize_row_neuron_##SFX(const block_neuron_##SFX * GGML_RESTRICT x,     \
+                                                float * GGML_RESTRICT y, int64_t k);           \
+    GGML_API size_t quantize_neuron_##SFX(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, \
+                                          int64_t nrow, int64_t n_per_row, const float * quant_weights);
+
+NEURON_L_DECL(l4)
+NEURON_L_DECL(l5)
+NEURON_L_DECL(l6)
 
 #ifdef __cplusplus
 }

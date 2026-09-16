@@ -72,6 +72,8 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "NEURON_M8", LLAMA_FTYPE_MOSTLY_NEURON_M8, "8.59 bpw, neuron pair codec", },
     { "NEURON_V4", LLAMA_FTYPE_MOSTLY_NEURON_V4, "4.375 bpw, neuron d=2 VQ codec", },
     { "NEURON_L4", LLAMA_FTYPE_MOSTLY_NEURON_L4, "4.375 bpw, neuron lattice: 4-bit level per value, fitted levels", },
+    { "NEURON_L5", LLAMA_FTYPE_MOSTLY_NEURON_L5, "5.375 bpw, neuron lattice: 32 levels, fitted levels", },
+    { "NEURON_L6", LLAMA_FTYPE_MOSTLY_NEURON_L6, "6.5 bpw, neuron lattice: 64 levels, fitted levels", },
     { "NEURON_V6", LLAMA_FTYPE_MOSTLY_NEURON_V6, "6.5 bpw, neuron d=2 VQ codec", },
     { "NEURON_D4", LLAMA_FTYPE_MOSTLY_NEURON_D4, "4.375 bpw, neuron d=4 VQ -- v4's size, 1 MiB codebook, high compute", },
     { "NEURON_V5", LLAMA_FTYPE_MOSTLY_NEURON_V5, "5.125 bpw, neuron d=2 VQ codec", },

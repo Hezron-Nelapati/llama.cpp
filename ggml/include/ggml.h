@@ -464,7 +464,12 @@ extern "C" {
         // Codes are numbers, not codeword indices, so kernels multiply by them instead of
         // reading a 256-entry table, and input gradients are running sums instead of scatters.
         GGML_TYPE_NEURON_L4 = 55,
-        GGML_TYPE_COUNT   = 56,
+        // The same lattice with a taller table: 32 levels at 5.375 bpw, 64 at 6.5. The low 4 bits
+        // of an index stay in l4's nibble plane and the rest ride in a second plane, so a kernel
+        // unpacks l4 and adds the high bits.
+        GGML_TYPE_NEURON_L5 = 56,
+        GGML_TYPE_NEURON_L6 = 57,
+        GGML_TYPE_COUNT   = 58,
     };
 
     // [TAG_GGML_PREC]
@@ -522,6 +527,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_NEURON_V4 = 29, // except 1d tensors; v4 codebook, 4.375 bpw
         GGML_FTYPE_MOSTLY_NEURON_L4 = 30, // except 1d tensors; lattice levels, 4.375 bpw
+        GGML_FTYPE_MOSTLY_NEURON_L5 = 31, // except 1d tensors; lattice levels, 5.375 bpw
+        GGML_FTYPE_MOSTLY_NEURON_L6 = 32, // except 1d tensors; lattice levels, 6.5 bpw
     };
 
     // available tensor operations:
@@ -2991,12 +2998,17 @@ extern "C" {
     GGML_API int           ggml_neuron_d4_codebook_len(void);  // K * dim, in floats
 
     #define GGML_NEURON_L4_LEVELS 16
-    // neuron_l4 levels: 16 ascending values with L[15-i] = -L[i]. Bound from the model file
-    // ("neuron.l4.levels") or fitted at quantize time. NULL restores the shipped table.
-    GGML_API void          ggml_neuron_l4_set_levels(const float * lv);
-    GGML_API const float * ggml_neuron_l4_get_levels(void);
-    GGML_API bool          ggml_neuron_l4_levels_is_custom(void);
-    GGML_API uint64_t      ggml_neuron_l4_levels_hash(void);
+    #define GGML_NEURON_L5_LEVELS 32
+    #define GGML_NEURON_L6_LEVELS 64
+    // Lattice levels: n ascending values with L[n-1-i] = -L[i]. Bound from the model file
+    // ("neuron.l4.levels" and so on) or fitted at quantize time. NULL restores the shipped table.
+    GGML_API int           ggml_neuron_l_n_levels(enum ggml_type type);     // 0 if not a lattice type
+    GGML_API void          ggml_neuron_l_set_levels(enum ggml_type type, const float * lv);
+    GGML_API const float * ggml_neuron_l_get_levels(enum ggml_type type);
+    GGML_API bool          ggml_neuron_l_levels_is_custom(enum ggml_type type);
+    GGML_API uint64_t      ggml_neuron_l_levels_hash(void);                 // over every lattice table
+    // level index of every value in a row of blocks, for fitting the table
+    GGML_API void          ggml_neuron_l_get_indices(enum ggml_type type, const void * blocks, int64_t k, uint8_t * idx);
 
     // calls ggml_quantize_init internally (i.e. can allocate memory)
     GGML_API size_t ggml_quantize_chunk(

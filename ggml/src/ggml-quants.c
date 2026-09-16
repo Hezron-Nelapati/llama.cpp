@@ -5650,15 +5650,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         NEURON_V_VALIDATE(4)
         NEURON_V_VALIDATE(5)
         NEURON_V_VALIDATE(6)
-        case GGML_TYPE_NEURON_L4:
-            {
-                const block_neuron_l4 * q = (const block_neuron_l4 *) data;
-                for (size_t i = 0; i < nb; ++i) {
-                    if (!isfinite(GGML_FP16_TO_FP32(q[i].d))) {
-                        return false;
-                    }
-                }
+#define NEURON_L_VALIDATE(SFX, UP)                                                         \
+        case GGML_TYPE_NEURON_##UP:                                                        \
+            {                                                                              \
+                const block_neuron_##SFX * q = (const block_neuron_##SFX *) data;          \
+                for (size_t i = 0; i < nb; ++i) {                                          \
+                    if (!isfinite(GGML_FP16_TO_FP32(q[i].d))) {                            \
+                        return false;                                                      \
+                    }                                                                      \
+                }                                                                          \
             } break;
+        NEURON_L_VALIDATE(l4, L4)
+        NEURON_L_VALIDATE(l5, L5)
+        NEURON_L_VALIDATE(l6, L6)
         case GGML_TYPE_NEURON_D4:
             {
                 const block_neuron_d4 * q = (const block_neuron_d4 *) data;
@@ -6724,32 +6728,98 @@ int ggml_neuron_vq_codebook_size(enum ggml_type type) {
 // the search, so the 16-value loop vectorises.
 // ---------------------------------------------------------------------------------------
 
-#define NEURON_L4_REFIT 2
+#define NEURON_L_REFIT   2
+#define NEURON_L_MAX_NL  NEURON_L6_NL
 
-static float         g_l4_own[NEURON_L4_NL];
+// One description per lattice type. Everything below reads the block through these offsets, so
+// l4, l5 and l6 share one encoder and one decoder.
+typedef struct {
+    int           nl;      // levels
+    int           sbb;     // sub-block index bits
+    int           nsbt;    // sub-block multipliers
+    const float * sbt;     // the multiplier table
+    int           hib;     // index bits per value above the low nibble
+    size_t        sboff;   // byte offset of sb[] in the block
+    size_t        qsoff;   // byte offset of qs[], the low-nibble plane
+    size_t        hioff;   // byte offset of hi[], the high-bit plane
+    size_t        size;    // block size
+    const float * shipped; // the compiled-in level table
+    float *       own;     // where a bound table is kept
+    const float **cur;     // the table in use
+} neuron_l_spec;
+
+static float g_l4_own[NEURON_L4_NL], g_l5_own[NEURON_L5_NL], g_l6_own[NEURON_L6_NL];
 static const float * g_l4_lv = kNeuronL4;
+static const float * g_l5_lv = kNeuronL5;
+static const float * g_l6_lv = kNeuronL6;
 
-void ggml_neuron_l4_set_levels(const float * lv) {
-    if (lv) {
-        memcpy(g_l4_own, lv, sizeof(g_l4_own));
-        g_l4_lv = g_l4_own;
-    } else {
-        g_l4_lv = kNeuronL4;
+#define NEURON_L_SPEC(SFX, UP)                                                                \
+    { NEURON_##UP##_NL, NEURON_##UP##_SBB, (NEURON_##UP##_SBB) == 6 ? 64 : 16,                \
+      (NEURON_##UP##_SBB) == 6 ? kNeuronVQSB64 : kNeuronVQSB, HIB_##UP,                       \
+      offsetof(block_neuron_##SFX, sb), offsetof(block_neuron_##SFX, qs), HIOFF_##UP,         \
+      sizeof(block_neuron_##SFX), kNeuron##UP, g_##SFX##_own, &g_##SFX##_lv }
+
+#define HIB_L4   0
+#define HIB_L5   NEURON_L5_HIB
+#define HIB_L6   NEURON_L6_HIB
+#define HIOFF_L4 0
+#define HIOFF_L5 offsetof(block_neuron_l5, hi)
+#define HIOFF_L6 offsetof(block_neuron_l6, hi)
+
+static const neuron_l_spec g_l_spec[3] = {
+    NEURON_L_SPEC(l4, L4),
+    NEURON_L_SPEC(l5, L5),
+    NEURON_L_SPEC(l6, L6),
+};
+
+static const neuron_l_spec * neuron_l_spec_of(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_NEURON_L4: return &g_l_spec[0];
+        case GGML_TYPE_NEURON_L5: return &g_l_spec[1];
+        case GGML_TYPE_NEURON_L6: return &g_l_spec[2];
+        default:                  return NULL;
     }
 }
 
-const float * ggml_neuron_l4_get_levels(void) {
-    return g_l4_lv;
+int ggml_neuron_l_n_levels(enum ggml_type type) {
+    const neuron_l_spec * sp = neuron_l_spec_of(type);
+    return sp ? sp->nl : 0;
 }
 
-bool ggml_neuron_l4_levels_is_custom(void) {
-    return g_l4_lv != kNeuronL4;
+void ggml_neuron_l_set_levels(enum ggml_type type, const float * lv) {
+    const neuron_l_spec * sp = neuron_l_spec_of(type);
+    if (!sp) {
+        return;
+    }
+    if (lv) {
+        memcpy(sp->own, lv, sizeof(float) * sp->nl);
+        *sp->cur = sp->own;
+    } else {
+        *sp->cur = sp->shipped;
+    }
 }
 
-uint64_t ggml_neuron_l4_levels_hash(void) {
+const float * ggml_neuron_l_get_levels(enum ggml_type type) {
+    const neuron_l_spec * sp = neuron_l_spec_of(type);
+    return sp ? *sp->cur : NULL;
+}
+
+bool ggml_neuron_l_levels_is_custom(enum ggml_type type) {
+    const neuron_l_spec * sp = neuron_l_spec_of(type);
+    return sp && *sp->cur != sp->shipped;
+}
+
+uint64_t ggml_neuron_l_levels_hash(void) {
     uint64_t h = 1469598103934665603ULL;
-    const unsigned char * spans[2] = { (const unsigned char *) g_l4_lv, (const unsigned char *) kNeuronVQSB };
-    const size_t          lens [2] = { sizeof(float) * NEURON_L4_NL, sizeof(kNeuronVQSB) };
+    for (int i = 0; i < 3; ++i) {
+        const unsigned char * p = (const unsigned char *) *g_l_spec[i].cur;
+        for (size_t j = 0; j < sizeof(float) * (size_t) g_l_spec[i].nl; ++j) {
+            h ^= (uint64_t) p[j];
+            h *= 1099511628211ULL;
+        }
+    }
+    const unsigned char * spans[2] = { (const unsigned char *) kNeuronVQSB, (const unsigned char *) kNeuronVQSB64 };
+    const size_t          lens [2] = { sizeof(kNeuronVQSB), sizeof(kNeuronVQSB64) };
     for (int i = 0; i < 2; ++i) {
         for (size_t j = 0; j < lens[i]; ++j) {
             h ^= (uint64_t) spans[i][j];
@@ -6760,13 +6830,15 @@ uint64_t ggml_neuron_l4_levels_hash(void) {
 }
 
 typedef struct {
+    int   nb;                            // boundaries, nl/2 - 1
     float mag0;
-    float bnd [NEURON_L4_NL/2 - 1];
-    float step[NEURON_L4_NL/2 - 1];
-} neuron_l4_grid;
+    float bnd [NEURON_L_MAX_NL/2 - 1];
+    float step[NEURON_L_MAX_NL/2 - 1];
+} neuron_l_grid;
 
-static void neuron_l4_grid_init(neuron_l4_grid * gr, const float * L) {
-    const int H = NEURON_L4_NL/2;
+static void neuron_l_grid_init(neuron_l_grid * gr, const neuron_l_spec * sp, const float * L) {
+    const int H = sp->nl/2;
+    gr->nb   = H - 1;
     gr->mag0 = L[H];
     for (int k = 0; k < H - 1; ++k) {
         gr->bnd [k] = 0.5f * (L[H + k] + L[H + k + 1]);
@@ -6776,15 +6848,15 @@ static void neuron_l4_grid_init(neuron_l4_grid * gr, const float * L) {
 
 // squared error of 16 magnitudes at scale g, and their magnitude indices. aw weights each value by
 // what it is worth to the model (the imatrix column), or NULL for plain squared error.
-static inline float neuron_l4_sse16(const neuron_l4_grid * gr, const float * GGML_RESTRICT a,
-                                    const float * GGML_RESTRICT aw, float g, uint8_t * GGML_RESTRICT idx) {
+static inline float neuron_l_sse16(const neuron_l_grid * gr, const float * GGML_RESTRICT a,
+                                   const float * GGML_RESTRICT aw, float g, uint8_t * GGML_RESTRICT idx) {
     const float inv = 1.0f / g;
     float sse = 0.0f;
     for (int v = 0; v < 16; ++v) {
         const float t = a[v] * inv;
         float r = gr->mag0;
         int   n = 0;
-        for (int k = 0; k < NEURON_L4_NL/2 - 1; ++k) {
+        for (int k = 0; k < gr->nb; ++k) {
             const int above = t > gr->bnd[k];
             r += (float) above * gr->step[k];
             n += above;
@@ -6798,28 +6870,83 @@ static inline float neuron_l4_sse16(const neuron_l4_grid * gr, const float * GGM
     return sse;
 }
 
+// read and write a sub-block multiplier index of sp->sbb bits, the way the v family does
+static inline int neuron_l_sb_get(const uint8_t * sb, int s, int sbb) {
+    const int bit = s * sbb;
+    int v = sb[bit >> 3];
+    if ((bit & 7) + sbb > 8) {
+        v |= (int) sb[(bit >> 3) + 1] << 8;
+    }
+    return (v >> (bit & 7)) & ((1 << sbb) - 1);
+}
+
+static inline void neuron_l_sb_put(uint8_t * sb, int s, int sbb, int m) {
+    const int bit = s * sbb;
+    sb[bit >> 3] |= (uint8_t) (m << (bit & 7));
+    if ((bit & 7) + sbb > 8) {
+        sb[(bit >> 3) + 1] |= (uint8_t) (m >> (8 - (bit & 7)));
+    }
+}
+
+static inline int neuron_l_idx_get(const uint8_t * qs, const uint8_t * hi, int v, int hib) {
+    int n = (qs[v >> 1] >> ((v & 1) * 4)) & 15;
+    if (hib) {
+        const int bit = v * hib;
+        n |= (((hi[bit >> 3] >> (bit & 7)) & ((1 << hib) - 1)) << 4);
+    }
+    return n;
+}
+
+static inline void neuron_l_idx_put(uint8_t * qs, uint8_t * hi, int v, int hib, int n) {
+    qs[v >> 1] |= (uint8_t) ((n & 15) << ((v & 1) * 4));
+    if (hib) {
+        const int bit = v * hib;
+        hi[bit >> 3] |= (uint8_t) ((n >> 4) << (bit & 7));
+    }
+}
+
+void ggml_neuron_l_get_indices(enum ggml_type type, const void * blocks, int64_t k, uint8_t * idx) {
+    const neuron_l_spec * sp = neuron_l_spec_of(type);
+    if (!sp) {
+        return;
+    }
+    const uint8_t * x  = (const uint8_t *) blocks;
+    const int64_t   nb = k / QK_NEURON;
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t * blk = x + (size_t) i * sp->size;
+        const uint8_t * qs  = blk + sp->qsoff;
+        const uint8_t * hi  = sp->hib ? blk + sp->hioff : NULL;
+        for (int v = 0; v < QK_NEURON; ++v) {
+            idx[i*QK_NEURON + v] = (uint8_t) neuron_l_idx_get(qs, hi, v, sp->hib);
+        }
+    }
+}
+
 // A weight matters to the model only through the activations it multiplies, so the search minimises
 // sum_v aw_v (x_v - d*sbt[m]*L[n])^2 with aw the imatrix column. Nearest level is unchanged: one
 // weight's aw scales every candidate alike. aw is NULL for a plain quantise.
-static void quantize_row_neuron_l4_impl(const float * GGML_RESTRICT x, block_neuron_l4 * GGML_RESTRICT y,
-                                        int64_t k, const float * GGML_RESTRICT quant_weights) {
+static void quantize_row_neuron_l_impl(const neuron_l_spec * sp, const float * GGML_RESTRICT x,
+                                       uint8_t * GGML_RESTRICT y, int64_t k,
+                                       const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_NEURON == 0);
-    const int64_t nb = k / QK_NEURON;
-    const int     H  = NEURON_L4_NL/2;
-    const float * L  = g_l4_lv;
+    const int64_t nb  = k / QK_NEURON;
+    const int     H   = sp->nl/2;
+    const float * L   = *sp->cur;
+    const float * sbt = sp->sbt;
 
-    neuron_l4_grid gr;
-    neuron_l4_grid_init(&gr, L);
+    neuron_l_grid gr;
+    neuron_l_grid_init(&gr, sp, L);
 
     for (int64_t i = 0; i < nb; ++i) {
         const float * xb = x + i*QK_NEURON;
+        uint8_t * blk = y + (size_t) i * sp->size;
         float ax[QK_NEURON];
         float amax = 0.0f;
         for (int j = 0; j < QK_NEURON; ++j) {
             ax[j] = fabsf(xb[j]);
             amax  = MAX(amax, ax[j]);
         }
-        memset(&y[i], 0, sizeof(block_neuron_l4));
+        memset(blk, 0, sp->size);
         if (amax == 0.0f) {
             continue;
         }
@@ -6829,28 +6956,28 @@ static void quantize_row_neuron_l4_impl(const float * GGML_RESTRICT x, block_neu
         float   d = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(amax));
         const float * qwb = quant_weights ? quant_weights + i*QK_NEURON : NULL;
 
-        for (int it = 0; it <= NEURON_L4_REFIT; ++it) {
-            // inner: all 16 multipliers per sub-block, keep the lowest error
+        for (int it = 0; it <= NEURON_L_REFIT; ++it) {
+            // inner: every multiplier per sub-block, keep the lowest error
             for (int s = 0; s < NEURON_VQ_NSB; ++s) {
                 const float * a  = ax + s*NEURON_VQ_SBV;
                 const float * aw = qwb ? qwb + s*NEURON_VQ_SBV : NULL;
                 int   bj = 0;
                 float be = INFINITY;
-                for (int j = 0; j < 16; ++j) {
-                    const float g = d * kNeuronVQSB[j];
-                    const float e = neuron_l4_sse16(&gr, a, aw, g, NULL);
+                for (int j = 0; j < sp->nsbt; ++j) {
+                    const float g = d * sbt[j];
+                    const float e = neuron_l_sse16(&gr, a, aw, g, NULL);
                     if (e < be) { be = e; bj = j; }
                 }
                 mi[s] = bj;
-                neuron_l4_sse16(&gr, a, aw, d * kNeuronVQSB[bj], idx + s*NEURON_VQ_SBV);
+                neuron_l_sse16(&gr, a, aw, d * sbt[bj], idx + s*NEURON_VQ_SBV);
             }
-            if (it == NEURON_L4_REFIT) {
+            if (it == NEURON_L_REFIT) {
                 break;
             }
             // outer: closed-form block scale against the chosen multipliers and levels, weighted too
             float num = 0.0f, den = 0.0f;
             for (int j = 0; j < QK_NEURON; ++j) {
-                const float r = kNeuronVQSB[mi[j / NEURON_VQ_SBV]] * L[H + idx[j]];
+                const float r = sbt[mi[j / NEURON_VQ_SBV]] * L[H + idx[j]];
                 const float w = qwb ? qwb[j] : 1.0f;
                 num += w * ax[j] * r;
                 den += w * r * r;
@@ -6867,44 +6994,65 @@ static void quantize_row_neuron_l4_impl(const float * GGML_RESTRICT x, block_neu
             d = dn;
         }
 
-        y[i].d = GGML_FP32_TO_FP16(d);
+        ggml_half dh = GGML_FP32_TO_FP16(d);
+        memcpy(blk, &dh, sizeof(dh));
+        uint8_t * sb = blk + sp->sboff;
+        uint8_t * qs = blk + sp->qsoff;
+        uint8_t * hi = sp->hib ? blk + sp->hioff : NULL;
         for (int s = 0; s < NEURON_VQ_NSB; ++s) {
-            y[i].sb[s >> 1] |= (uint8_t) (mi[s] << ((s & 1) * 4));
+            neuron_l_sb_put(sb, s, sp->sbb, mi[s]);
         }
         for (int j = 0; j < QK_NEURON; ++j) {
             const int n = xb[j] < 0.0f ? H - 1 - idx[j] : H + idx[j];
-            y[i].qs[j >> 1] |= (uint8_t) (n << ((j & 1) * 4));
+            neuron_l_idx_put(qs, hi, j, sp->hib, n);
         }
     }
 }
 
-void dequantize_row_neuron_l4(const block_neuron_l4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+static void dequantize_row_neuron_l_impl(const neuron_l_spec * sp, const uint8_t * GGML_RESTRICT x,
+                                         float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_NEURON == 0);
-    const int64_t nb = k / QK_NEURON;
-    const float * L  = g_l4_lv;
+    const int64_t nb  = k / QK_NEURON;
+    const float * L   = *sp->cur;
+    const float * sbt = sp->sbt;
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * blk = x + (size_t) i * sp->size;
+        ggml_half dh;
+        memcpy(&dh, blk, sizeof(dh));
+        const float d = GGML_FP16_TO_FP32(dh);
+        const uint8_t * sb = blk + sp->sboff;
+        const uint8_t * qs = blk + sp->qsoff;
+        const uint8_t * hi = sp->hib ? blk + sp->hioff : NULL;
         for (int s = 0; s < NEURON_VQ_NSB; ++s) {
-            const float g = d * kNeuronVQSB[(x[i].sb[s >> 1] >> ((s & 1) * 4)) & 15];
+            const float g = d * sbt[neuron_l_sb_get(sb, s, sp->sbb)];
             for (int v = s*NEURON_VQ_SBV; v < (s + 1)*NEURON_VQ_SBV; ++v) {
-                y[i*QK_NEURON + v] = g * L[(x[i].qs[v >> 1] >> ((v & 1) * 4)) & 15];
+                y[i*QK_NEURON + v] = g * L[neuron_l_idx_get(qs, hi, v, sp->hib)];
             }
         }
     }
 }
 
-void quantize_row_neuron_l4_ref(const float * GGML_RESTRICT x, block_neuron_l4 * GGML_RESTRICT y, int64_t k) {
-    quantize_row_neuron_l4_impl(x, y, k, NULL);
-}
-
-size_t quantize_neuron_l4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
-                          int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    const size_t row_size = ggml_row_size(GGML_TYPE_NEURON_L4, n_per_row);
-    char * qrow = (char *) dst;
-    for (int64_t r = 0; r < nrow; ++r) {
-        quantize_row_neuron_l4_impl(src, (block_neuron_l4 *) qrow, n_per_row, quant_weights);
-        src  += n_per_row;
-        qrow += row_size;
+#define NEURON_L_ENTRY(SFX, TY)                                                                       \
+    void quantize_row_neuron_##SFX##_ref(const float * GGML_RESTRICT x,                               \
+                                         block_neuron_##SFX * GGML_RESTRICT y, int64_t k) {           \
+        quantize_row_neuron_l_impl(neuron_l_spec_of(TY), x, (uint8_t *) y, k, NULL);                   \
+    }                                                                                                 \
+    void dequantize_row_neuron_##SFX(const block_neuron_##SFX * GGML_RESTRICT x,                      \
+                                     float * GGML_RESTRICT y, int64_t k) {                            \
+        dequantize_row_neuron_l_impl(neuron_l_spec_of(TY), (const uint8_t *) x, y, k);                 \
+    }                                                                                                 \
+    size_t quantize_neuron_##SFX(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,           \
+                                 int64_t nrow, int64_t n_per_row, const float * quant_weights) {      \
+        const size_t row_size = ggml_row_size(TY, n_per_row);                                         \
+        char * qrow = (char *) dst;                                                                   \
+        for (int64_t r = 0; r < nrow; ++r) {                                                          \
+            quantize_row_neuron_l_impl(neuron_l_spec_of(TY), src, (uint8_t *) qrow, n_per_row, quant_weights); \
+            src  += n_per_row;                                                                        \
+            qrow += row_size;                                                                         \
+        }                                                                                             \
+        return nrow * row_size;                                                                       \
     }
-    return nrow * row_size;
-}
+
+NEURON_L_ENTRY(l4, GGML_TYPE_NEURON_L4)
+NEURON_L_ENTRY(l5, GGML_TYPE_NEURON_L5)
+NEURON_L_ENTRY(l6, GGML_TYPE_NEURON_L6)

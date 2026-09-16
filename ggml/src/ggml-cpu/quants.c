@@ -1572,39 +1572,58 @@ NEURON_V_VEC_DOT(4)
 NEURON_V_VEC_DOT(5)
 NEURON_V_VEC_DOT(6)
 
-// neuron_l4: levels are decoded per 16-value sub-block into a local array, so the dot itself
-// runs over plain floats. One multiplier per sub-block, hoisted out of the value loop.
-void ggml_vec_dot_neuron_l4_f32(int n, float * GGML_RESTRICT s, size_t bs,
-                                const void * GGML_RESTRICT vx, size_t bx,
-                                const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
-    const block_neuron_l4 * GGML_RESTRICT x = vx;
-    const float * GGML_RESTRICT y = vy;
-    const float * L = ggml_neuron_l4_get_levels();
-    const int nb = n / QK_NEURON;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        const float d = GGML_FP16_TO_FP32(x[i].d);
-        const float * yb = y + (size_t) i * QK_NEURON;
-        for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {
-            const float g = d * kNeuronVQSB[(x[i].sb[sblk >> 1] >> ((sblk & 1) * 4)) & 15];
-            const uint8_t * q = x[i].qs + sblk * (NEURON_VQ_SBV / 2);
-            float lv[NEURON_VQ_SBV];
-            for (int v = 0; v < NEURON_VQ_SBV / 2; ++v) {
-                lv[2*v]     = L[q[v] & 15];
-                lv[2*v + 1] = L[q[v] >> 4];
-            }
-            const float * ys = yb + sblk * NEURON_VQ_SBV;
-            float acc = 0.0f;
-            for (int v = 0; v < NEURON_VQ_SBV; ++v) {
-                acc += lv[v] * ys[v];
-            }
-            sum += g * acc;
+// levels of one 16-value sub-block. hi is the high-bit plane of l5/l6, NULL for l4.
+static inline void neuron_l_levels16(float * GGML_RESTRICT lv, const float * GGML_RESTRICT L,
+                                     const uint8_t * GGML_RESTRICT q, const uint8_t * GGML_RESTRICT hi, int hib) {
+    for (int v = 0; v < NEURON_VQ_SBV; ++v) {
+        int n = (q[v >> 1] >> ((v & 1) * 4)) & 15;
+        if (hib) {
+            const int b = v * hib;
+            n |= ((hi[b >> 3] >> (b & 7)) & ((1 << hib) - 1)) << 4;
         }
+        lv[v] = L[n];
     }
-    *s = sum;
 }
 
-void quantize_row_neuron_l4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_neuron_l4_ref(x, (block_neuron_l4 *) y, k);
-}
+// neuron lattice: levels are decoded per 16-value sub-block into a local array, so the dot itself
+// runs over plain floats. One multiplier per sub-block, hoisted out of the value loop.
+#define NEURON_L_VEC_DOT(SFX, TY, SBB, HIB, HIPTR)                                               \
+    void ggml_vec_dot_neuron_##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,              \
+                                    const void * GGML_RESTRICT vx, size_t bx,                    \
+                                    const void * GGML_RESTRICT vy, size_t by, int nrc) {         \
+        GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);                     \
+        const block_neuron_##SFX * GGML_RESTRICT x = vx;                                         \
+        const float * GGML_RESTRICT y = vy;                                                      \
+        const float * L   = ggml_neuron_l_get_levels(TY);                                        \
+        const float * sbt = (SBB) == 6 ? kNeuronVQSB64 : kNeuronVQSB;                            \
+        const int nb = n / QK_NEURON;                                                            \
+        float sum = 0.0f;                                                                        \
+        for (int i = 0; i < nb; ++i) {                                                           \
+            const float d = GGML_FP16_TO_FP32(x[i].d);                                           \
+            const float * yb = y + (size_t) i * QK_NEURON;                                       \
+            for (int sblk = 0; sblk < NEURON_VQ_NSB; ++sblk) {                                   \
+                const int bit = sblk * (SBB);                                                    \
+                int m = x[i].sb[bit >> 3];                                                       \
+                if ((bit & 7) + (SBB) > 8) {                                                     \
+                    m |= (int) x[i].sb[(bit >> 3) + 1] << 8;                                     \
+                }                                                                                \
+                const float g = d * sbt[(m >> (bit & 7)) & ((1 << (SBB)) - 1)];                  \
+                float lv[NEURON_VQ_SBV];                                                         \
+                neuron_l_levels16(lv, L, x[i].qs + sblk * (NEURON_VQ_SBV / 2), HIPTR, HIB);      \
+                const float * ys = yb + sblk * NEURON_VQ_SBV;                                    \
+                float acc = 0.0f;                                                                \
+                for (int v = 0; v < NEURON_VQ_SBV; ++v) {                                        \
+                    acc += lv[v] * ys[v];                                                        \
+                }                                                                                \
+                sum += g * acc;                                                                  \
+            }                                                                                    \
+        }                                                                                        \
+        *s = sum;                                                                                \
+    }                                                                                            \
+    void quantize_row_neuron_##SFX(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) { \
+        quantize_row_neuron_##SFX##_ref(x, (block_neuron_##SFX *) y, k);                         \
+    }
+
+NEURON_L_VEC_DOT(l4, GGML_TYPE_NEURON_L4, 4, 0, NULL)
+NEURON_L_VEC_DOT(l5, GGML_TYPE_NEURON_L5, 4, NEURON_L5_HIB, x[i].hi + sblk * (NEURON_VQ_SBV * NEURON_L5_HIB / 8))
+NEURON_L_VEC_DOT(l6, GGML_TYPE_NEURON_L6, 6, NEURON_L6_HIB, x[i].hi + sblk * (NEURON_VQ_SBV * NEURON_L6_HIB / 8))

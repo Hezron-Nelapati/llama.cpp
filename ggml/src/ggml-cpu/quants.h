@@ -133,10 +133,15 @@ void ggml_vec_dot_neuron_d4_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                 const void * GGML_RESTRICT vy, size_t by,
                                 int nrc);
 void quantize_row_neuron_d4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
-void ggml_vec_dot_neuron_l4_f32(int n, float * GGML_RESTRICT s, size_t bs,
-                                const void * GGML_RESTRICT vx, size_t bx,
-                                const void * GGML_RESTRICT vy, size_t by, int nrc);
-void quantize_row_neuron_l4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+#define NEURON_L_CPU_DECL(SFX)                                                              \
+    void ggml_vec_dot_neuron_##SFX##_f32(int n, float * GGML_RESTRICT s, size_t bs,         \
+                                    const void * GGML_RESTRICT vx, size_t bx,               \
+                                    const void * GGML_RESTRICT vy, size_t by, int nrc);     \
+    void quantize_row_neuron_##SFX(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
+NEURON_L_CPU_DECL(l4)
+NEURON_L_CPU_DECL(l5)
+NEURON_L_CPU_DECL(l6)
 
 #ifdef __cplusplus
 }

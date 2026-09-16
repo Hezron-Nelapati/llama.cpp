@@ -404,7 +404,9 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             // neuron_v* are 128-block types; these are the nearest 32-block rates
             case GGML_TYPE_NEURON_V4: return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_NEURON_D4: return_type = GGML_TYPE_Q4_0; break;
-            case GGML_TYPE_NEURON_L4: return_type = GGML_TYPE_Q4_0; break;
+            case GGML_TYPE_NEURON_L4:
+            case GGML_TYPE_NEURON_L5:
+            case GGML_TYPE_NEURON_L6: return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_NEURON_V5: return_type = GGML_TYPE_Q5_0; break;
             case GGML_TYPE_NEURON_V6: return_type = GGML_TYPE_Q8_0; break;
             default:
@@ -1007,20 +1009,20 @@ static std::vector<float> llama_neuron_fit_codebook(
     return out;
 }
 
-// Fit the 16 neuron_l4 levels on this model's own weights. Lloyd with the real encoder in the
+// Fit a lattice level table on this model's own weights. Lloyd with the real encoder in the
 // loop: encode sampled blocks with the current levels (scale search included), then move each
 // magnitude to the scale-weighted mean of the values that picked it:
 //   mag[j] = sum w g |x| / sum w g^2        w = max(|x|/g, floor)^-alpha
-// Levels stay symmetric, so only 8 magnitudes are fitted. Fixed recipe: 12 rounds from the uniform
+// Levels stay symmetric, so only half of them are fitted. Fixed recipe: 12 rounds from the uniform
 // grid at alpha 2.5, top level scaled to 1 at the end. Running alpha 2.5 to its fixed point was
 // measured worse on held-out text (14.10 vs 13.95 perplexity), so the round count is part of it.
-static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, float alpha, uint32_t seed,
+static std::vector<float> llama_neuron_fit_l_levels(llama_model_loader & ml, ggml_type type, float alpha, uint32_t seed,
         const std::unordered_map<std::string, std::vector<float>> * imatrix) {
-    const ggml_type T      = GGML_TYPE_NEURON_L4;
+    const ggml_type T      = type;
     const int       BLK    = (int) ggml_blck_size(T);
     const size_t    TSZ    = ggml_type_size(T);
-    const size_t    QOFF   = TSZ - BLK / 2;             // codes are the last BLK/2 bytes of a block
-    const int       H      = GGML_NEURON_L4_LEVELS / 2;
+    const int       NL     = ggml_neuron_l_n_levels(T);
+    const int       H      = NL / 2;
     const size_t    NBLK   = 32768;
     const int       ROUNDS = 12;
 
@@ -1118,8 +1120,9 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
     const int nth = std::max(1, (int) std::thread::hardware_concurrency());
     ggml_quantize_init(T);
 
+    std::vector<uint8_t> nidx(nb * BLK);
     for (int r = 0; r < ROUNDS; ++r) {
-        ggml_neuron_l4_set_levels(L.data());
+        ggml_neuron_l_set_levels(T, L.data());
         std::vector<std::thread> workers;
         for (int t = 0; t < nth; ++t) {
             const size_t lo = nb * t / nth, hi = nb * (t + 1) / nth;
@@ -1136,13 +1139,14 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
 
         // reconstruction is g * L[n] and no level is zero, so g = rec / L[n]
         const float tfloor = 1.0f / (2*H);
-        double num[GGML_NEURON_L4_LEVELS / 2] = {0}, den[GGML_NEURON_L4_LEVELS / 2] = {0}, sse = 0.0, tot = 0.0;
+        ggml_neuron_l_get_indices(T, q.data(), (int64_t) nb * BLK, nidx.data());
+        std::vector<double> num(H, 0.0), den(H, 0.0);
+        double sse = 0.0, tot = 0.0;
         for (size_t i = 0; i < nb; ++i) {
-            const uint8_t * qs = q.data() + i * TSZ + QOFF;
             for (int v = 0; v < BLK; ++v) {
                 const float x = X[i * BLK + v];
                 const float y = R[i * BLK + v];
-                const int   n = (qs[v >> 1] >> ((v & 1) * 4)) & 15;
+                const int   n = nidx[i * BLK + v];
                 const int   j = n >= H ? n - H : H - 1 - n;
                 const float g = y / L[n];
                 const double e = (double) x - y;
@@ -1156,24 +1160,27 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
                 den[j] += (double) wv * g * g;
             }
         }
-        float mag[GGML_NEURON_L4_LEVELS / 2];
+        std::vector<float> mag(H);
         for (int j = 0; j < H; ++j) {
             mag[j] = den[j] > 0.0 ? (float) (num[j] / den[j]) : L[H + j];
         }
-        std::sort(mag, mag + H);
+        std::sort(mag.begin(), mag.end());
         for (int j = 0; j < H; ++j) {
             L[H + j]     =  mag[j];
             L[H - 1 - j] = -mag[j];
         }
-        LLAMA_LOG_INFO("%s: round %2d  rel mse %.6e  levels %.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n", __func__, r + 1,
-                       sse / std::max(tot, 1e-30), L[H], L[H+1], L[H+2], L[H+3], L[H+4], L[H+5], L[H+6], L[H+7]);
+        LLAMA_LOG_INFO("%s: round %2d  rel mse %.6e  levels %.4f %.4f %.4f %.4f\n", __func__, r + 1,
+                       sse / std::max(tot, 1e-30), L[H], L[H + H/4], L[H + H/2], L[2*H - 1]);
     }
     // d and the levels share one scale (d*L == (d/c)*(c*L)): state the table with its top at 1
     const float top = L[2*H - 1] > 0.0f ? L[2*H - 1] : 1.0f;
     for (float & v : L) {
         v /= top;
     }
-    LLAMA_LOG_INFO("%s: fitted on %zu blocks (alpha %.2f, seed %u)\n", __func__, nb, alpha, seed);
+    LLAMA_LOG_INFO("%s: %s fitted on %zu blocks (alpha %.2f, seed %u)\n", __func__, ggml_type_name(T), nb, alpha, seed);
+    for (int j = 0; j < H; ++j) {
+        LLAMA_LOG_INFO("%s: level %2d %+.7f\n", __func__, j, L[H + j]);
+    }
     return L;
 }
 
@@ -1405,6 +1412,8 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_NEURON_V6: return GGML_TYPE_NEURON_V6;
         case LLAMA_FTYPE_MOSTLY_NEURON_D4: return GGML_TYPE_NEURON_D4;
         case LLAMA_FTYPE_MOSTLY_NEURON_L4: return GGML_TYPE_NEURON_L4;
+        case LLAMA_FTYPE_MOSTLY_NEURON_L5: return GGML_TYPE_NEURON_L5;
+        case LLAMA_FTYPE_MOSTLY_NEURON_L6: return GGML_TYPE_NEURON_L6;
         case LLAMA_FTYPE_MOSTLY_NEURON_V5: return GGML_TYPE_NEURON_V5;
         case LLAMA_FTYPE_MOSTLY_Q5_K_M:  return GGML_TYPE_Q5_K;
         case LLAMA_FTYPE_MOSTLY_Q6_K:    return GGML_TYPE_Q6_K;
@@ -1534,18 +1543,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // exactly this way, and a perplexity run against the matching binary looked fine, so
     // nothing caught it. Stamp the table hash; llama_model_loader refuses a mismatch.
     switch (default_type) {
-        case GGML_TYPE_NEURON_L4: {
+        case GGML_TYPE_NEURON_L4:
+        case GGML_TYPE_NEURON_L5:
+        case GGML_TYPE_NEURON_L6: {
             // always fitted: the levels are a property of the model. Fit before any tensor is
             // encoded, so the table in the file is the one that encoded it.
             {
                 const float alpha = std::isnan(params->neuron_fit_alpha) ? 2.5f : params->neuron_fit_alpha;
-                const std::vector<float> fit = llama_neuron_fit_l4_levels(ml, alpha, params->neuron_fit_seed, imatrix_data);
+                const std::vector<float> fit = llama_neuron_fit_l_levels(ml, default_type, alpha,
+                                                                         params->neuron_fit_seed, imatrix_data);
                 if (!fit.empty()) {
-                    ggml_neuron_l4_set_levels(fit.data());
+                    ggml_neuron_l_set_levels(default_type, fit.data());
                 }
             }
-            gguf_set_arr_data(ctx_out.get(), "neuron.l4.levels", GGUF_TYPE_FLOAT32,
-                              ggml_neuron_l4_get_levels(), (size_t) GGML_NEURON_L4_LEVELS);
+            const char * tag = default_type == GGML_TYPE_NEURON_L4 ? "neuron.l4.levels"
+                             : default_type == GGML_TYPE_NEURON_L5 ? "neuron.l5.levels" : "neuron.l6.levels";
+            gguf_set_arr_data(ctx_out.get(), tag, GGUF_TYPE_FLOAT32,
+                              ggml_neuron_l_get_levels(default_type),
+                              (size_t) ggml_neuron_l_n_levels(default_type));
         } break;
         case GGML_TYPE_NEURON_D4: {
             const float * tbl = ggml_neuron_d4_get_codebook();

@@ -354,6 +354,18 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_NEURON_L5] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_l5,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_l5_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_NEURON_L6] = {
+        .from_float               = (ggml_from_float_t) quantize_row_neuron_l6,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_l6_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_NEURON_V4] = {
         .from_float               = (ggml_from_float_t) quantize_row_neuron_v4,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_neuron_v4_f32,

@@ -397,6 +397,7 @@ NEURON_V_BLOCK(6)
 //   n = (qs[v >> 1] >> ((v & 1) * 4)) & 15      w = d * kNeuronVQSB[m] * kNeuronL4[n]
 // Kernels multiply by the level instead of reading a codeword, so no per-pair table exists.
 #define NEURON_L4_NL   16
+#define NEURON_L4_SBB  4
 typedef struct {
     ggml_half d;
     uint8_t   sb[NEURON_VQ_SBBY(4)];
@@ -404,6 +405,37 @@ typedef struct {
 } block_neuron_l4;
 static_assert(sizeof(block_neuron_l4) == sizeof(ggml_half) + NEURON_VQ_SBBY(4) + QK_NEURON / 2,
               "wrong block_neuron_l4 size/padding");
+
+// l5 and l6 -- the same lattice with a taller table. The low 4 bits of every index stay in l4's
+// nibble plane, so the unpack is l4's; the remaining bits ride in a second plane hi[]:
+//   n = ((qs[v >> 1] >> ((v & 1) * 4)) & 15) | (high bits of value v) << 4
+// l6 resolves its sub-block multiplier to 6 bits as v6 does, because a 64-level grid is fine
+// enough that a 4-bit multiplier becomes the binding error.
+#define NEURON_L5_NL   32
+#define NEURON_L5_SBB  4
+#define NEURON_L5_HIB  1                                /* extra index bits per value   */
+typedef struct {
+    ggml_half d;
+    uint8_t   sb[NEURON_VQ_SBBY(NEURON_L5_SBB)];
+    uint8_t   qs[QK_NEURON / 2];
+    uint8_t   hi[QK_NEURON * NEURON_L5_HIB / 8];
+} block_neuron_l5;
+static_assert(sizeof(block_neuron_l5) == sizeof(ggml_half) + NEURON_VQ_SBBY(NEURON_L5_SBB) +
+              QK_NEURON / 2 + QK_NEURON * NEURON_L5_HIB / 8,
+              "wrong block_neuron_l5 size/padding");
+
+#define NEURON_L6_NL   64
+#define NEURON_L6_SBB  6
+#define NEURON_L6_HIB  2
+typedef struct {
+    ggml_half d;
+    uint8_t   sb[NEURON_VQ_SBBY(NEURON_L6_SBB)];
+    uint8_t   qs[QK_NEURON / 2];
+    uint8_t   hi[QK_NEURON * NEURON_L6_HIB / 8];
+} block_neuron_l6;
+static_assert(sizeof(block_neuron_l6) == sizeof(ggml_half) + NEURON_VQ_SBBY(NEURON_L6_SBB) +
+              QK_NEURON / 2 + QK_NEURON * NEURON_L6_HIB / 8,
+              "wrong block_neuron_l6 size/padding");
 
 #define QK4_0 32
 typedef struct {
@@ -744,6 +776,26 @@ GGML_TABLE_END()
 // alpha 2.5 to its fixed point 14.10.
 GGML_TABLE_BEGIN(float, kNeuronL4, 16)
     -1.0000000f, -0.7949443f, -0.6251937f, -0.4671594f, -0.3161376f, -0.1844370f, -0.0872916f, -0.0303227f, +0.0303227f, +0.0872916f, +0.1844370f, +0.3161376f, +0.4671594f, +0.6251937f, +0.7949443f, +1.0000000f,
+GGML_TABLE_END()
+
+// l5 and l6 tables, fitted by l4's recipe on Qwen3-0.6B: 12 rounds from the uniform grid,
+// alpha 2.5, top level at 1.
+GGML_TABLE_BEGIN(float, kNeuronL5, 32)
+    -1.0000000f, -0.9155220f, -0.8408044f, -0.7712293f, -0.7047356f, -0.6394680f, -0.5746830f, -0.5101290f,
+    -0.4448315f, -0.3781273f, -0.3086790f, -0.2354441f, -0.1612951f, -0.0946085f, -0.0448018f, -0.0155450f,
+    +0.0155450f, +0.0448018f, +0.0946085f, +0.1612951f, +0.2354441f, +0.3086790f, +0.3781273f, +0.4448315f,
+    +0.5101290f, +0.5746830f, +0.6394680f, +0.7047356f, +0.7712293f, +0.8408044f, +0.9155220f, +1.0000000f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, kNeuronL6, 64)
+    -1.0000000f, -0.9606845f, -0.9255943f, -0.8929595f, -0.8604763f, -0.8281796f, -0.7952334f, -0.7629052f,
+    -0.7317156f, -0.7002189f, -0.6687948f, -0.6375726f, -0.6061816f, -0.5744601f, -0.5429804f, -0.5115994f,
+    -0.4801325f, -0.4485027f, -0.4168935f, -0.3852397f, -0.3534514f, -0.3217154f, -0.2896483f, -0.2574107f,
+    -0.2245399f, -0.1910677f, -0.1562687f, -0.1193450f, -0.0820196f, -0.0482248f, -0.0228394f, -0.0079694f,
+    +0.0079694f, +0.0228394f, +0.0482248f, +0.0820196f, +0.1193450f, +0.1562687f, +0.1910677f, +0.2245399f,
+    +0.2574107f, +0.2896483f, +0.3217154f, +0.3534514f, +0.3852397f, +0.4168935f, +0.4485027f, +0.4801325f,
+    +0.5115994f, +0.5429804f, +0.5744601f, +0.6061816f, +0.6375726f, +0.6687948f, +0.7002189f, +0.7317156f,
+    +0.7629052f, +0.7952334f, +0.8281796f, +0.8604763f, +0.8929595f, +0.9255943f, +0.9606845f, +1.0000000f,
 GGML_TABLE_END()
 
 // The neuron_v6 codebook: 4096 points in the pair plane, same fit as kNeuronVQ4/5 --

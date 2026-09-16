@@ -183,31 +183,48 @@ struct ggml_metal_library {
 // constant-address arrays, which is the free tier of the lookup cost hierarchy -- passing the
 // table as a buffer instead would cost the prompt path 45%. Rewriting the source keeps every
 // lookup exactly as it was and needs no kernel change at all.
-// Every table the kernels take from source: v* codebooks and neuron_l4 levels.
+// Every table the kernels take from source: v* codebooks and the lattice level tables.
 static uint64_t ggml_metal_neuron_tables_hash(void) {
-    return ggml_neuron_vq_codebook_hash() ^ ggml_neuron_l4_levels_hash();
+    return ggml_neuron_vq_codebook_hash() ^ ggml_neuron_l_levels_hash();
+}
+
+static bool ggml_metal_neuron_l_any_custom(void) {
+    return ggml_neuron_l_levels_is_custom(GGML_TYPE_NEURON_L4) ||
+           ggml_neuron_l_levels_is_custom(GGML_TYPE_NEURON_L5) ||
+           ggml_neuron_l_levels_is_custom(GGML_TYPE_NEURON_L6);
 }
 
 static NSString * ggml_metal_source_apply_codebook(NSString * src) {
-    if (!ggml_neuron_vq_codebook_is_custom(GGML_TYPE_COUNT) && !ggml_neuron_l4_levels_is_custom()) {
+    if (!ggml_neuron_vq_codebook_is_custom(GGML_TYPE_COUNT) && !ggml_metal_neuron_l_any_custom()) {
         return src;
     }
     NSMutableString * out = [src mutableCopy];
-    if (ggml_neuron_l4_levels_is_custom()) {
-        const float * lv = ggml_neuron_l4_get_levels();
-        const NSRange rh = [out rangeOfString:@"GGML_TABLE_BEGIN(float, kNeuronL4, 16)"];
-        if (rh.location != NSNotFound) {
+    {
+        const enum ggml_type ltypes[3] = { GGML_TYPE_NEURON_L4, GGML_TYPE_NEURON_L5, GGML_TYPE_NEURON_L6 };
+        const char *         lname [3] = { "kNeuronL4", "kNeuronL5", "kNeuronL6" };
+        for (int t = 0; t < 3; ++t) {
+            if (!ggml_neuron_l_levels_is_custom(ltypes[t])) {
+                continue;
+            }
+            const float * lv = ggml_neuron_l_get_levels(ltypes[t]);
+            const int     nl = ggml_neuron_l_n_levels(ltypes[t]);
+            NSString * head = [NSString stringWithFormat:@"GGML_TABLE_BEGIN(float, %s, %d)", lname[t], nl];
+            const NSRange rh = [out rangeOfString:head];
+            if (rh.location == NSNotFound) {
+                continue;
+            }
             const NSRange rest = NSMakeRange(NSMaxRange(rh), out.length - NSMaxRange(rh));
             const NSRange rt   = [out rangeOfString:@"GGML_TABLE_END()" options:0 range:rest];
-            if (rt.location != NSNotFound) {
-                NSMutableString * body = [NSMutableString stringWithCapacity:16*20];
-                [body appendString:@"\n"];
-                for (int i = 0; i < 16; ++i) {
-                    [body appendFormat:@"%+.9ef,%s", lv[i], (i % 8 == 7) ? "\n" : " "];
-                }
-                [out replaceCharactersInRange:NSMakeRange(NSMaxRange(rh), rt.location - NSMaxRange(rh)) withString:body];
-                GGML_LOG_DEBUG("%s: kNeuronL4 <- the model's own levels\n", __func__);
+            if (rt.location == NSNotFound) {
+                continue;
             }
+            NSMutableString * body = [NSMutableString stringWithCapacity:(NSUInteger) nl*20];
+            [body appendString:@"\n"];
+            for (int i = 0; i < nl; ++i) {
+                [body appendFormat:@"%+.9ef,%s", lv[i], (i % 8 == 7) ? "\n" : " "];
+            }
+            [out replaceCharactersInRange:NSMakeRange(NSMaxRange(rh), rt.location - NSMaxRange(rh)) withString:body];
+            GGML_LOG_DEBUG("%s: %s <- the model's own levels\n", __func__, lname[t]);
         }
     }
     const enum ggml_type types[3] = { GGML_TYPE_NEURON_V4, GGML_TYPE_NEURON_V5, GGML_TYPE_NEURON_V6 };
@@ -2060,7 +2077,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
         case GGML_OP_MUL_MAT_ID:
-            if (op->src[0]->type == GGML_TYPE_NEURON_L4) {
+            if (op->src[0]->type == GGML_TYPE_NEURON_L4 ||
+                op->src[0]->type == GGML_TYPE_NEURON_L5 ||
+                op->src[0]->type == GGML_TYPE_NEURON_L6) {
                 return false; // no mul_mv_id / mul_mm_id kernels for the lattice yet
             }
             return ggml_metal_supports_mul_mat_op(

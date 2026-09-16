@@ -1158,3 +1158,40 @@ void dequantize_neuron_l4(device const block_neuron_l4 *xb, short il, thread typ
         reg[s][3] = d * kNeuronL4[(w >> 12) & 15];
     }
 }
+
+// neuron_l5: l4's nibble plane plus one high bit per value, 2 bytes per 16-value slice.
+template <typename type4x4>
+void dequantize_neuron_l5(device const block_neuron_l5 *xb, short il, thread type4x4 & reg) {
+    const float d = (float) xb->d * kNeuronVQSB[(xb->sb[il >> 1] >> ((il & 1) * 4)) & 15];
+    device const ushort * qw = (device const ushort *) (xb->qs + il * 8);
+    device const uchar  * hb = xb->hi + il * 2;
+    FOR_UNROLL (short s = 0; s < 4; ++s) {
+        const uint w = qw[s];
+        const uint h = hb[s >> 1] >> ((s & 1) * 4);
+        reg[s][0] = d * kNeuronL5[( w        & 15) | (( h       & 1) << 4)];
+        reg[s][1] = d * kNeuronL5[((w >>  4) & 15) | (((h >> 1) & 1) << 4)];
+        reg[s][2] = d * kNeuronL5[((w >>  8) & 15) | (((h >> 2) & 1) << 4)];
+        reg[s][3] = d * kNeuronL5[((w >> 12) & 15) | (((h >> 3) & 1) << 4)];
+    }
+}
+
+// neuron_l6: two high bits per value (4 bytes per slice) and a 6-bit sub-block index.
+template <typename type4x4>
+void dequantize_neuron_l6(device const block_neuron_l6 *xb, short il, thread type4x4 & reg) {
+    const short bit = il * 6;
+    uint m = xb->sb[bit >> 3];
+    if ((bit & 7) + 6 > 8) {
+        m |= (uint) xb->sb[(bit >> 3) + 1] << 8;
+    }
+    const float d = (float) xb->d * kNeuronVQSB64[(m >> (bit & 7)) & 63];
+    device const ushort * qw = (device const ushort *) (xb->qs + il * 8);
+    device const uchar  * hb = xb->hi + il * 4;
+    FOR_UNROLL (short s = 0; s < 4; ++s) {
+        const uint w = qw[s];
+        const uint h = hb[s];
+        reg[s][0] = d * kNeuronL6[( w        & 15) | (( h       & 3) << 4)];
+        reg[s][1] = d * kNeuronL6[((w >>  4) & 15) | (((h >> 2) & 3) << 4)];
+        reg[s][2] = d * kNeuronL6[((w >>  8) & 15) | (((h >> 4) & 3) << 4)];
+        reg[s][3] = d * kNeuronL6[((w >> 12) & 15) | (((h >> 6) & 3) << 4)];
+    }
+}

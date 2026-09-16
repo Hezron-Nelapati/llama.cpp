@@ -8846,6 +8846,8 @@ static const ggml_type base_types[] = {
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
     GGML_TYPE_IQ2_XXS,
     GGML_TYPE_NEURON_L4,
+    GGML_TYPE_NEURON_L5,
+    GGML_TYPE_NEURON_L6,
 };
 
 static const ggml_type other_types[] = {
