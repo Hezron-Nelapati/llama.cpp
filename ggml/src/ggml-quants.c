@@ -6774,9 +6774,10 @@ static void neuron_l4_grid_init(neuron_l4_grid * gr, const float * L) {
     }
 }
 
-// squared error of 16 magnitudes at scale g, and their magnitude indices
+// squared error of 16 magnitudes at scale g, and their magnitude indices. aw weights each value by
+// what it is worth to the model (the imatrix column), or NULL for plain squared error.
 static inline float neuron_l4_sse16(const neuron_l4_grid * gr, const float * GGML_RESTRICT a,
-                                    float g, uint8_t * GGML_RESTRICT idx) {
+                                    const float * GGML_RESTRICT aw, float g, uint8_t * GGML_RESTRICT idx) {
     const float inv = 1.0f / g;
     float sse = 0.0f;
     for (int v = 0; v < 16; ++v) {
@@ -6789,7 +6790,7 @@ static inline float neuron_l4_sse16(const neuron_l4_grid * gr, const float * GGM
             n += above;
         }
         const float e = a[v] - g * r;
-        sse += e * e;
+        sse += (aw ? aw[v] : 1.0f) * e * e;
         if (idx) {
             idx[v] = (uint8_t) n;
         }
@@ -6797,7 +6798,11 @@ static inline float neuron_l4_sse16(const neuron_l4_grid * gr, const float * GGM
     return sse;
 }
 
-void quantize_row_neuron_l4_ref(const float * GGML_RESTRICT x, block_neuron_l4 * GGML_RESTRICT y, int64_t k) {
+// A weight matters to the model only through the activations it multiplies, so the search minimises
+// sum_v aw_v (x_v - d*sbt[m]*L[n])^2 with aw the imatrix column. Nearest level is unchanged: one
+// weight's aw scales every candidate alike. aw is NULL for a plain quantise.
+static void quantize_row_neuron_l4_impl(const float * GGML_RESTRICT x, block_neuron_l4 * GGML_RESTRICT y,
+                                        int64_t k, const float * GGML_RESTRICT quant_weights) {
     assert(k % QK_NEURON == 0);
     const int64_t nb = k / QK_NEURON;
     const int     H  = NEURON_L4_NL/2;
@@ -6822,30 +6827,33 @@ void quantize_row_neuron_l4_ref(const float * GGML_RESTRICT x, block_neuron_l4 *
         uint8_t idx[QK_NEURON];
         int     mi[NEURON_VQ_NSB];
         float   d = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(amax));
+        const float * qwb = quant_weights ? quant_weights + i*QK_NEURON : NULL;
 
         for (int it = 0; it <= NEURON_L4_REFIT; ++it) {
             // inner: all 16 multipliers per sub-block, keep the lowest error
             for (int s = 0; s < NEURON_VQ_NSB; ++s) {
-                const float * a = ax + s*NEURON_VQ_SBV;
+                const float * a  = ax + s*NEURON_VQ_SBV;
+                const float * aw = qwb ? qwb + s*NEURON_VQ_SBV : NULL;
                 int   bj = 0;
                 float be = INFINITY;
                 for (int j = 0; j < 16; ++j) {
                     const float g = d * kNeuronVQSB[j];
-                    const float e = neuron_l4_sse16(&gr, a, g, NULL);
+                    const float e = neuron_l4_sse16(&gr, a, aw, g, NULL);
                     if (e < be) { be = e; bj = j; }
                 }
                 mi[s] = bj;
-                neuron_l4_sse16(&gr, a, d * kNeuronVQSB[bj], idx + s*NEURON_VQ_SBV);
+                neuron_l4_sse16(&gr, a, aw, d * kNeuronVQSB[bj], idx + s*NEURON_VQ_SBV);
             }
             if (it == NEURON_L4_REFIT) {
                 break;
             }
-            // outer: closed-form block scale against the chosen multipliers and levels
+            // outer: closed-form block scale against the chosen multipliers and levels, weighted too
             float num = 0.0f, den = 0.0f;
             for (int j = 0; j < QK_NEURON; ++j) {
                 const float r = kNeuronVQSB[mi[j / NEURON_VQ_SBV]] * L[H + idx[j]];
-                num += ax[j] * r;
-                den += r * r;
+                const float w = qwb ? qwb[j] : 1.0f;
+                num += w * ax[j] * r;
+                den += w * r * r;
             }
             if (den <= 0.0f || num <= 0.0f) {
                 break;
@@ -6885,13 +6893,16 @@ void dequantize_row_neuron_l4(const block_neuron_l4 * GGML_RESTRICT x, float * G
     }
 }
 
+void quantize_row_neuron_l4_ref(const float * GGML_RESTRICT x, block_neuron_l4 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_neuron_l4_impl(x, y, k, NULL);
+}
+
 size_t quantize_neuron_l4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                           int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    GGML_UNUSED(quant_weights);
     const size_t row_size = ggml_row_size(GGML_TYPE_NEURON_L4, n_per_row);
     char * qrow = (char *) dst;
     for (int64_t r = 0; r < nrow; ++r) {
-        quantize_row_neuron_l4_ref(src, (block_neuron_l4 *) qrow, n_per_row);
+        quantize_row_neuron_l4_impl(src, (block_neuron_l4 *) qrow, n_per_row, quant_weights);
         src  += n_per_row;
         qrow += row_size;
     }

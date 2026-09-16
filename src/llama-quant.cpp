@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <random>
 #include <cstring>
 #include <cinttypes>
@@ -1013,7 +1014,8 @@ static std::vector<float> llama_neuron_fit_codebook(
 // Levels stay symmetric, so only 8 magnitudes are fitted. Fixed recipe: 12 rounds from the uniform
 // grid at alpha 2.5, top level scaled to 1 at the end. Running alpha 2.5 to its fixed point was
 // measured worse on held-out text (14.10 vs 13.95 perplexity), so the round count is part of it.
-static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, float alpha, uint32_t seed) {
+static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, float alpha, uint32_t seed,
+        const std::unordered_map<std::string, std::vector<float>> * imatrix) {
     const ggml_type T      = GGML_TYPE_NEURON_L4;
     const int       BLK    = (int) ggml_blck_size(T);
     const size_t    TSZ    = ggml_type_size(T);
@@ -1042,13 +1044,29 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
     // 32768 blocks cost 9 s of a 52 s quantise. A block is 128 values of a row, so it is a whole
     // number of source blocks for f32/f16/bf16/q8_0; other source types are read in full.
     const size_t per = std::max<size_t>(1, NBLK / src.size());
-    std::vector<float> X;
+    std::vector<float> X, W;                    // sampled blocks and, with an imatrix, what each value is worth
     X.reserve(NBLK * BLK);
     std::vector<no_init<uint8_t>> buf;
     std::vector<float> f32;
     for (const auto * w : src) {
         const ggml_tensor * t  = w->tensor;
         const auto *        tt = ggml_get_type_traits(t->type);
+        // the tensor's importance per column, scaled to mean 1 so every tensor counts alike
+        std::vector<float> imp;
+        if (imatrix) {
+            const auto it = imatrix->find(ggml_get_name(t));
+            if (it != imatrix->end() && it->second.size() == (size_t) t->ne[0]) {
+                imp = it->second;
+                const double mean = std::accumulate(imp.begin(), imp.end(), 0.0) / imp.size();
+                if (mean > 0.0) {
+                    for (float & v : imp) {
+                        v = (float) (v / mean);
+                    }
+                } else {
+                    imp.clear();
+                }
+            }
+        }
         if (t->type != GGML_TYPE_F32 && !tt->to_float) {
             continue;
         }
@@ -1065,6 +1083,12 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
         for (size_t s = 0; s < std::min(per, nblk); ++s) {
             const size_t b = std::uniform_int_distribution<size_t>(0, nblk - 1)(rng);
             X.resize(X.size() + BLK);
+            W.resize(X.size());
+            float * dstw = W.data() + W.size() - BLK;
+            const size_t col = (b * BLK) % (size_t) t->ne[0];      // a block never crosses a row
+            for (int v = 0; v < BLK; ++v) {
+                dstw[v] = imp.empty() ? 1.0f : imp[col + v];
+            }
             float * dstb = X.data() + X.size() - BLK;
             if (!ranged) {
                 memcpy(dstb, f32.data() + b * BLK, BLK * sizeof(float));
@@ -1127,7 +1151,7 @@ static std::vector<float> llama_neuron_fit_l4_levels(llama_model_loader & ml, fl
                 if (!(g > 0.0f)) {
                     continue;
                 }
-                const float wv = alpha != 0.0f ? std::pow(std::max(std::fabs(x) / g, tfloor), -alpha) : 1.0f;
+                const float wv = (alpha != 0.0f ? std::pow(std::max(std::fabs(x) / g, tfloor), -alpha) : 1.0f) * W[i * BLK + v];
                 num[j] += (double) wv * g * std::fabs(x);
                 den[j] += (double) wv * g * g;
             }
@@ -1236,10 +1260,11 @@ static bool llama_tensor_quantize_gpu(
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
-    // The neuron v* encoder is the whole cost of a quantise and it is embarrassingly
-    // parallel over blocks, so hand the chunk to the GPU when one is there. Falls through
-    // to the CPU path below for every other type, and whenever the GPU declines.
-    {
+    // The neuron encoder is the whole cost of a quantise and it is embarrassingly parallel over
+    // blocks, so hand the chunk to the GPU when one is there. Falls through to the CPU path below
+    // for every other type, whenever the GPU declines, and whenever there are importance weights:
+    // the kernels take none, and silently dropping them would quantise against the wrong error.
+    if (!imatrix) {
         size_t gpu_size = 0;
         if (llama_tensor_quantize_gpu(new_type, f32_data, new_data, nrows, n_per_row, &gpu_size)) {
             return gpu_size;
@@ -1514,7 +1539,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // encoded, so the table in the file is the one that encoded it.
             {
                 const float alpha = std::isnan(params->neuron_fit_alpha) ? 2.5f : params->neuron_fit_alpha;
-                const std::vector<float> fit = llama_neuron_fit_l4_levels(ml, alpha, params->neuron_fit_seed);
+                const std::vector<float> fit = llama_neuron_fit_l4_levels(ml, alpha, params->neuron_fit_seed, imatrix_data);
                 if (!fit.empty()) {
                     ggml_neuron_l4_set_levels(fit.data());
                 }
